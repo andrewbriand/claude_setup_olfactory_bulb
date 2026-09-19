@@ -1,0 +1,8 @@
+src/
+build/
+install/
+venv/
+model/
+runs/
+logs/
+__pycache__/
