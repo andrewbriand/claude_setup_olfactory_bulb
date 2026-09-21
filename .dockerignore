@@ -1,0 +1,11 @@
+# Generated trees: never send these to the build context. src/ alone is >1 GB with
+# submodules, and shipping a host-built install/ into an image would bake in host RPATHs.
+src/
+build/
+install/
+venv/
+model/
+runs/
+logs/
+.ccache/
+.git/
