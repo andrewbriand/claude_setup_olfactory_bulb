@@ -43,8 +43,8 @@ document explicitly why the network legitimately changed.
    `EXTRA_PATCHES=02-sample-without-materializing`; it also needs *less* memory. If you optimise
    further, **profile before believing any lead** — `profile_setup.py` needs no GPU, and cProfile
    already refuted two plausible-looking leads that were read from the code.
-8. **Solver profiling**: NEURON patches 02–05 (default) cut spike-event delivery's GPU round trips
-   (~2x solver on the 4090, bit-identical). On the H100, measure them against the NVTX-only
+8. **Solver profiling**: NEURON patch 02 (default) cuts spike-event delivery's GPU round trips
+   (~2x solver on the 4090, bit-identical). On the H100, measure it against the NVTX-only
    baseline: `NRN_PATCHES_UPTO=01 ./02_build_neuron.sh && ./03_build_model.sh`, time, then
    `./02_build_neuron.sh && ./03_build_model.sh`, time again (same -n/-t/-g). To profile, run
    `./profile_bulb.sh -n 1 -t 20 -g first:32 -r 0`, read `runs/<dir>/rank0.phases.txt`. First run

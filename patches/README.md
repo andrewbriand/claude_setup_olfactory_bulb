@@ -38,11 +38,9 @@ of the series is already applied and applies the rest (`NRN_PATCHES_UPTO=NN` sto
 
 * **01-nvtx-ranges-for-coreneuron-phases.patch** — NVTX ranges for CoreNEURON's existing
   Instrumentor phases.
-* **02-skip-empty-net-receive-passes.patch** — (NMODL codegen) skip a mechanism's NET_RECEIVE pass
-  when nothing was delivered to it.
-* **03-fewer-net-receive-syncs.patch** — (NMODL codegen) drop a redundant stream wait and a no-op
-  send-count reset.
-* **04-single-copy-net-receive-buffer.patch** — (CoreNEURON) receive-buffer arrays as rows of one
-  pinned block; one 2D copy per upload instead of eight.
-* **05-batch-net-receive-passes.patch** — (CoreNEURON + NMODL codegen) launch all mechanisms'
-  NET_RECEIVE kernels, wait once, then process sent events in the original order.
+* **02-fewer-net-receive-round-trips.patch** — fewer GPU round trips in spike-event delivery,
+  three changes: (NMODL codegen) no redundant stream wait and no device reset of a send count
+  that is already zero; (CoreNEURON) receive-buffer arrays as rows of one pinned block, uploaded
+  with one 2D copy instead of eight; (CoreNEURON + codegen) all mechanisms' NET_RECEIVE kernels
+  launched back to back with one wait, send counts returned asynchronously, and sent events
+  processed in the original mechanism order.

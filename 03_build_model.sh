@@ -32,6 +32,19 @@ if [ "${NO_PATCHES:-0}" != "1" ]; then
 fi
 
 cd "$MODEL_DIR"
-nrnivmodl -coreneuron . 2>&1 | tee "$TOP/logs/nrnivmodl.log"
+# NVHPC gives each object a CUDA module ID made of a header path plus a small random number.
+# With ~20 mechanism objects two occasionally collide, and the device link then fails with
+# "redefinition of __cudaRegisterLinkedBinary_...". Recompiling draws new IDs, so retry.
+for attempt in 1 2 3; do
+  if nrnivmodl -coreneuron . 2>&1 | tee "$TOP/logs/nrnivmodl.log"; then
+    break
+  fi
+  if [ "$attempt" -lt 3 ] && grep -q "redefinition of .__cudaRegisterLinkedBinary" "$TOP/logs/nrnivmodl.log"; then
+    echo "CUDA module-ID collision in the device link (NVHPC); rebuilding mechanisms, attempt $((attempt + 1))"
+    rm -rf x86_64
+  else
+    exit 1
+  fi
+done
 test -x "$MODEL_DIR/x86_64/special"
 echo "Built $MODEL_DIR/x86_64/special"
