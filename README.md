@@ -61,10 +61,13 @@ bench.sh              sweeps: verify | quick | full
 compare_spikes.sh     check spike outputs of runs are identical
 summarize_runs.py     parse runs/*/run.log -> table + runs/summary.csv
 profile_bulb.sh       one nsys-profiled run -> runs/<ts>_prof_.../rank<N>.nsys-rep
+analyze_nvtx.py       attribute CUDA syncs/copies/launches/MPI to CoreNEURON's NVTX phases
+gpu_roundtrip_check.cu  platform check: GPU round-trip cost vs managed memory (see "NVTX ranges")
 profile_setup.py      cProfile the model's network construction (CPU-only, no GPU needed)
 repro_presyn_disconnect.py  standalone NEURON reproducer for the O(N^2) teardown
 patches/              applied to model/ by 03_build_model.sh; upstream src/ stays pristine
 patches/optional/     opt-in, enabled with EXTRA_PATCHES=<name> (changes results; see below)
+patches/nrn/          NEURON patches, applied to the src/nrn checkout by 02_build_neuron.sh
 dev_rebuild.sh        incremental rebuild after editing NEURON/CoreNEURON sources
 Dockerfile            targets: `bench` (all baked in) and `dev` (toolchain only)
 
@@ -88,6 +91,7 @@ Every value can be overridden from the environment, e.g. `CUDA_ARCH=90 ./02_buil
 | `OB_NEIGHBOUR_CACHE` | `65536` | entries in the setup speed-up cache (~19 KB each, per rank); `131072` if RAM allows, `0` disables. Read by the model at run time, not build time; exported by `config.sh` |
 | `OB_FAST_EXIT` | `1` | skip the O(P^2) object-graph teardown at exit (see "Setup and teardown performance"); `0` = upstream behaviour |
 | `NO_PATCHES` | `0` | `1` builds the model unpatched (baseline) |
+| `NO_NRN_PATCHES` | `0` | `1` makes `02_build_neuron.sh` reverse-apply `patches/nrn/*.patch` (currently: NVTX ranges) |
 | `EXTRA_PATCHES` | empty | opt-in patches from `patches/optional/` by name, or `all` |
 
 The NEURON build uses: `nvc`/`nvc++`/NVHPC `nvcc`, `NRN_ENABLE_CORENEURON=ON`,
@@ -508,6 +512,79 @@ dependencies are not bundled, install them into a venv with
 `pip install numpy pandas psutil pyarrow`). There is no way to merge `.nsys-rep` files; either open them
 together in the GUI, or capture the whole process tree in one session (`nsys profile mpirun ...`) to get
 a single report.
+
+### NVTX ranges for the solver phases
+
+CoreNEURON already annotates its timestep with `Instrumentor::phase` regions (`timestep`,
+`deliver-events`, `check-threshold`, `net-buf-receive-<mechanism>`, `update-net-receive-buf`,
+`state-update`, `setup-tree-matrix`, `matrix-solver`, `gap-v-transfer`, `spike-exchange`, ...), and the
+GPU build compiles its `CudaProfiling` backend (`-DCORENEURON_CUDA_PROFILING`), but that backend's
+`phase_begin`/`phase_end` were empty. `patches/nrn/01-nvtx-ranges-for-coreneuron-phases.patch` makes
+them `nvtxRangePushA`/`nvtxRangePop` (NVTX3 is header-only in the CUDA toolkit; with no tool attached
+the calls are near-free), so every phase shows up in Nsight Systems with no hand-placed ranges.
+`NRN_PROFILE_REGIONS=a,b,c` limits which phases are emitted. The patch doesn't change numerics
+(`bench.sh verify` passes, spikes identical to the unpatched references).
+
+`profile_bulb.sh` now also writes `rank<N>.phases.txt`, produced by `analyze_nvtx.py`. That joins the
+trace's NVTX ranges with CUDA API calls, GPU kernels and MPI calls (nsys's own reports summarize them
+separately), charging each API call to the innermost open phase and each kernel to the phase that
+launched it. Per phase and per timestep it reports inclusive/exclusive time, pure host (CPU) time, time
+blocked in syncs, device<->host copies, kernel launches and MPI, with counts, plus the GPU kernel time
+the phase launched:
+
+```bash
+./profile_bulb.sh -n 1 -t 20 -g first:32 -r 0     # 1 rank: no GPU time-slicing between ranks
+./analyze_nvtx.py runs/<dir>/rank0.nsys-rep       # re-run on any trace
+```
+
+Profile **one rank** unless MPS is running: with several ranks time-slicing one GPU, waits in one
+rank include other ranks' kernels, and the attribution becomes misleading.
+
+**What the solver's timestep is made of** (this box, 1 rank; counts are per timestep and do not
+change with model size, 5 glomeruli vs quarter bulb):
+
+| Phase | Syncs | Device->host copies | Host->device copies | Launches |
+|---|---|---|---|---|
+| `deliver-events` (own work) | 14 | 2 | — | 4 |
+| `check-threshold` (spike detection) | 8.4 | 7.7 | — | 2 |
+| `net-buf-receive-ThreshDetect` | 5.8 | 5.8 | — | 1 |
+| `net-buf-receive-AmpaNmda` | 5.6 | 4.5 | — | 1 |
+| `update-net-receive-buf` (+ `net-receive-buf-cpu2gpu`) | 4.5 | — | ~13 | — |
+| `gap-v-transfer` | 3 | 1 | 2 | 2 |
+| `net-buf-receive-FastInhib`, `-orn` | 2 each | — | — | 1 each |
+| `state-orn` | 2 | 1 (240 B) | 1 | 1 |
+| `matrix-solver` | 1 | — | — | 1 |
+| state/current kernels, 14 mechanisms | ~1 each | — | — | 1 each |
+
+About 64 syncs, 39 launches and 40 small copies per timestep, matching the H100 run's counts. Most of
+them come from spike-event delivery rather than from the numerics: `deliver-events` and its children
+are 54–65% of the timestep. The GPU does its real work in a handful of kernels (`nrn_state`/`nrn_cur`
+for `nax`, `kamt`, `kdrmt`, the Hines solver `solve_interleaved2`, `nrn_rhs`/`nrn_lhs`), 35 ms per
+step at quarter-bulb scale on the 4090, which leaves the GPU idle ~70% of each timestep.
+
+**Caveat: on WSL2 the *timings* are dominated by a platform artifact.** CoreNEURON allocates part of
+its GPU data with `cudaMallocManaged` (`allocate_unified()` in `src/coreneuron/utils/memory.cpp`:
+NMODL instance structs, Random123 streams, per-thread data). This GPU under WSL2 reports
+`concurrentManagedAccess=0`, so every launch and sync pays for *all* the managed memory the process
+holds, whether or not the host touched it:
+
+| Managed memory held | launch + sync (`gpu_roundtrip_check.cu`) |
+|---|---|
+| none | 32 µs |
+| 100 MB | 294 µs |
+| 1000 MB | 2,740 µs |
+
+That matches what the profiles show. In a quarter-bulb timestep (118 ms), the GPU is idle for 80 ms,
+and for 79 of those 80 ms the host is blocked *inside* a CUDA call: `cuLaunchKernel` averages 835 µs,
+all of it with the GPU idle, against 11 µs for a bare launch. Launch cost also scales with model size
+(164 µs at 5 glomeruli, 5.1x more at quarter bulb, for a 4.7x larger model), implying ~60 MB and
+~300 MB of managed memory respectively. On native Linux, `concurrentManagedAccess=1` and this cost
+should mostly disappear. **Measure the solver's CPU-boundedness on native Linux** (the H100 box); on
+WSL2, trust the per-step *counts* above but not the times. Check any machine with:
+
+```bash
+source env.sh && nvcc -O2 -arch=sm_${CUDA_ARCH} gpu_roundtrip_check.cu -o runs/gpu_roundtrip_check && runs/gpu_roundtrip_check
+```
 
 ## Container
 

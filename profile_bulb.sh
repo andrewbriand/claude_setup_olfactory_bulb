@@ -17,7 +17,10 @@
 #   -r  comma-separated ranks to profile, or "all" (default "all"). Unprofiled ranks
 #       run bare, so the job stays a normal N-rank MPI job either way.
 #
-# Output: runs/<timestamp>_prof_.../rank<N>.nsys-rep plus kernel/API summaries.
+# Output: runs/<timestamp>_prof_.../rank<N>.nsys-rep, kernel/API/NVTX summaries (CSV), and
+# rank<N>.phases.txt: CUDA syncs/copies/launches and MPI attributed to each CoreNEURON
+# phase (analyze_nvtx.py; needs the NVTX patch in patches/nrn/). Profile 1 rank to avoid
+# confounding from GPU time-slicing when MPS is unavailable (e.g. WSL2).
 set -euo pipefail
 TOP="$(cd "$(dirname "$0")" && pwd)"
 source "$TOP/env.sh"
@@ -85,6 +88,12 @@ ls -lh "$RUN_DIR"/*.nsys-rep 2>/dev/null || { echo "no .nsys-rep produced" >&2; 
 for rep in "$RUN_DIR"/*.nsys-rep; do
   b="${rep%.nsys-rep}"
   nsys stats --report cuda_gpu_kern_sum --report cuda_api_sum --report cuda_gpu_mem_time_sum \
+       --report nvtx_pushpop_sum \
        --format csv --output "$b" "$rep" > "$b.stats.log" 2>&1 || true
+  # Per-phase attribution of syncs/copies/launches/MPI (needs the NVTX NEURON patch).
+  "$TOP/analyze_nvtx.py" "$rep" > "$b.phases.txt" 2>&1 || true
 done
+echo "=== per-phase attribution, rank of first report (ms per timestep) ==="
+head -20 "$(ls "$RUN_DIR"/*.phases.txt | head -1)" 2>/dev/null || true
+tail -1 "$(ls "$RUN_DIR"/*.phases.txt | head -1)" 2>/dev/null || true
 echo "Run directory: $RUN_DIR"

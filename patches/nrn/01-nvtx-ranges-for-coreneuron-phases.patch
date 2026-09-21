@@ -1,0 +1,31 @@
+diff --git a/src/coreneuron/utils/profile/profiler_interface.h b/src/coreneuron/utils/profile/profiler_interface.h
+index 08e9a46fb..aaaf7c295 100644
+--- a/src/coreneuron/utils/profile/profiler_interface.h
++++ b/src/coreneuron/utils/profile/profiler_interface.h
+@@ -21,6 +21,7 @@
+ 
+ #ifdef CORENEURON_CUDA_PROFILING
+ #include <cuda_profiler_api.h>
++#include <nvtx3/nvToolsExt.h>
+ #endif
+ 
+ #if defined(CRAYPAT)
+@@ -230,9 +231,16 @@ struct Caliper {
+ #ifdef CORENEURON_CUDA_PROFILING
+ 
+ struct CudaProfiling {
+-    inline static void phase_begin(const char* name){};
++    // Emit every Instrumentor phase (timestep, state-update, spike-exchange, ...) as an NVTX
++    // range so Nsight Systems can attribute CUDA API calls and host gaps to solver phases.
++    // NVTX3 is header-only; with no tool attached these are near-free no-ops.
++    inline static void phase_begin(const char* name) {
++        nvtxRangePushA(name);
++    };
+ 
+-    inline static void phase_end(const char* name){};
++    inline static void phase_end(const char* name) {
++        nvtxRangePop();
++    };
+ 
+     inline static void start_profile() {
+         cudaProfilerStart();

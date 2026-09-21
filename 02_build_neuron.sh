@@ -13,6 +13,24 @@ export PATH="$NVHPC_ROOT/compilers/bin:$PATH"
 # Don't let a CUDA toolkit on PATH (e.g. /usr/local/cuda) be mixed with NVHPC's.
 unset CUDAHOSTCXX CUDA_HOME CUDA_PATH
 
+# NEURON patches (patches/nrn/*.patch) are applied to the src/nrn checkout, idempotently, so
+# the tree is always "pinned commit + these files" and never hand-edited. NO_NRN_PATCHES=1
+# reverse-applies any that are present. Pristine tree: git -C src/nrn checkout -- .
+for p in "$TOP"/patches/nrn/*.patch; do
+  [ -e "$p" ] || break
+  if git -C "$SRC_DIR/nrn" apply --reverse --check "$p" 2>/dev/null; then
+    if [ "${NO_NRN_PATCHES:-0}" = "1" ]; then
+      echo "reverting NEURON patch $(basename "$p")"
+      git -C "$SRC_DIR/nrn" apply --reverse "$p"
+    else
+      echo "NEURON patch already applied: $(basename "$p")"
+    fi
+  elif [ "${NO_NRN_PATCHES:-0}" != "1" ]; then
+    echo "applying NEURON patch $(basename "$p")"
+    git -C "$SRC_DIR/nrn" apply "$p"
+  fi
+done
+
 mkdir -p "$BUILD_DIR" "$TOP/logs"
 echo "NVHPC: $NVHPC_ROOT | CUDA_ARCH: $CUDA_ARCH | MPI: $(command -v mpicc) | prefix: $PREFIX"
 

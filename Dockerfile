@@ -140,6 +140,7 @@ COPY --chown=1000:1000 00_fetch_sources.sh 01_setup_python.sh ./
 RUN ./00_fetch_sources.sh && ./01_setup_python.sh
 
 COPY --chown=1000:1000 02_build_neuron.sh ./
+COPY --chown=1000:1000 patches/nrn/ ./patches/nrn/
 RUN ./02_build_neuron.sh
 
 COPY --chown=1000:1000 03_build_model.sh bulb_bench.py profile_setup.py ./
@@ -147,7 +148,8 @@ COPY --chown=1000:1000 patches/ ./patches/
 RUN ./03_build_model.sh
 
 COPY --chown=1000:1000 run_bulb.sh bench.sh profile_bulb.sh compare_spikes.sh \
-                       summarize_runs.py dev_rebuild.sh ./
+                       summarize_runs.py dev_rebuild.sh analyze_nvtx.py \
+                       gpu_roundtrip_check.cu ./
 
 RUN printf 'nrn %s\nolfactory-bulb-3d %s\n' \
       "$(git -C src/nrn rev-parse HEAD)" \

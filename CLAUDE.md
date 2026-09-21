@@ -2,10 +2,13 @@
 
 Goal: build NEURON + CoreNEURON with GPU support and run the olfactory-bulb-3d model on this
 machine's GPU, then benchmark it. README.md has the full reference; this file is the procedure.
-Do not modify the upstream checkouts in `src/`. Model changes go in `patches/*.patch`, which
-`03_build_model.sh` applies to the `model/` copy (`NO_PATCHES=1` rebuilds the baseline); every
-patch must keep spikes bit-identical, verified with `compare_spikes.sh` against an unpatched run,
-or else document explicitly why the network legitimately changed.
+Do not hand-edit the upstream checkouts in `src/`. Model changes go in `patches/*.patch`, which
+`03_build_model.sh` applies to the `model/` copy (`NO_PATCHES=1` rebuilds the baseline). NEURON
+changes go in `patches/nrn/*.patch`, which `02_build_neuron.sh` applies to `src/nrn` idempotently
+(`NO_NRN_PATCHES=1` reverts them); after editing CoreNEURON, the model must be relinked
+(`03_build_model.sh` or `dev_rebuild.sh`) because CoreNEURON is linked statically. Every patch must
+keep spikes bit-identical, verified with `compare_spikes.sh` against an unpatched run, or else
+document explicitly why the network legitimately changed.
 
 ## Procedure
 
@@ -40,7 +43,11 @@ or else document explicitly why the network legitimately changed.
    `EXTRA_PATCHES=02-sample-without-materializing`; it also needs *less* memory. If you optimise
    further, **profile before believing any lead** — `profile_setup.py` needs no GPU, and cProfile
    already refuted two plausible-looking leads that were read from the code.
-8. **Teardown is fixed by default** (`OB_FAST_EXIT=1`; root cause is an O(P^2) loop in NEURON's
+8. **Solver profiling**: build with the NVTX patch (default), run
+   `./profile_bulb.sh -n 1 -t 20 -g first:32 -r 0`, read `runs/<dir>/rank0.phases.txt`. First run
+   `gpu_roundtrip_check.cu` (README "NVTX ranges"): if `concurrentManagedAccess=0` (e.g. WSL2), solver
+   timings are dominated by managed-memory overhead and only the per-step counts are meaningful.
+9. **Teardown is fixed by default** (`OB_FAST_EXIT=1`; root cause is an O(P^2) loop in NEURON's
    `presyn_disconnect`, see README "Setup and teardown performance"). The next post-setup target is `h.stdinit()`
    (~7 s at quarter bulb / 4 ranks), then weight-file writing. On the H100, measure wall clock
    with and without `OB_FAST_EXIT` at full bulb — the expected saving is most of the ~12 min.
