@@ -1,0 +1,121 @@
+--- a/lateral_connections.py
++++ b/lateral_connections.py
+@@ -51,12 +51,18 @@
+ pos2type = {}
+ _gran_voxel = set([ (0, 0, 0) ])
+ 
+-def gc_is_superficial(ggid):  
+-  p = granules.ggid2pos[ggid]
+-  # it fix the granule cells type
+-  up = misc.Ellipsoid(params.bulbCenter, params.granAxisUp)
+-  dw = misc.Ellipsoid(params.bulbCenter, params.granAxisDw)
+-  return (dw.normalRadius(p)-1)/(dw.normalRadius(up.project(p))-1) > 0.5
++_gcissup = {}
++
++def gc_is_superficial(ggid):
++  # Pure function of ggid, called ~2x per granule (~18 us each) while building
++  # synapses and granules: memoize it, and use the boundary ellipsoids built once
++  # in init() instead of constructing two per call.
++  r = _gcissup.get(ggid)
++  if r is None:
++    p = granules.ggid2pos[ggid]
++    r = _gcissup[ggid] = \
++        (_BND_DW.normalRadius(p)-1)/(_BND_DW.normalRadius(_BND_UP.project(p))-1) > 0.5
++  return r
+ 
+ def init():
+   from math import exp
+--- a/mgrs.py
++++ b/mgrs.py
+@@ -26,6 +26,27 @@
+ 
+ 
+ 
++# Each `h.<Name>` is a HOC symbol lookup costing ~1.55 us, and MGRS.__init__ does
++# ~7 of them per synapse on a ~40 us floor. Bind them once, lazily, because the
++# templates (GranuleSpine) are only defined once the .hoc files have been loaded.
++_hoc_bound = False
++_ThreshDetect = _FastInhib = _FastInhibSTDP = _AmpaNmda = _GranuleSpine = _NetCon = None
++
++
++def _bind_hoc():
++  global _hoc_bound, _ThreshDetect, _FastInhib, _FastInhibSTDP
++  global _AmpaNmda, _GranuleSpine, _NetCon
++  _ThreshDetect = h.ThreshDetect
++  _AmpaNmda = h.AmpaNmda
++  _GranuleSpine = h.GranuleSpine
++  _NetCon = h.NetCon
++  if params.use_fi_stdp:
++    _FastInhibSTDP = h.FastInhibSTDP
++  else:
++    _FastInhib = h.FastInhib
++  _hoc_bound = True
++
++
+ class MGRS:
+   '''From a mitral and granule synapse location, and consistent with what
+      exists on this process, construct the 5 parts of the reciprocal synapse.
+@@ -45,6 +66,8 @@
+   '''
+ 
+   def __init__(self, mgid, isec, xm, ggid, ipri, xg, slot):
++    if not _hoc_bound:
++      _bind_hoc()
+     self.mgid = mgid
+     self.ggid = ggid
+     self.slot = slot
+@@ -73,16 +96,16 @@
+       raise RuntimeError
+ 
+     if self.msecden:
+-      self.md = h.ThreshDetect(self.msecden(xm))
++      self.md = _ThreshDetect(self.msecden(xm))
+       if params.use_fi_stdp:
+-        self.fi = h.FastInhibSTDP(self.msecden(xm))
+-        nc = h.NetCon(self.md, self.fi)
++        self.fi = _FastInhibSTDP(self.msecden(xm))
++        nc = _NetCon(self.md, self.fi)
+         self.postspike2fi = nc
+         nc.weight[0] = -1
+         nc.delay = 1
+ 
+       else:
+-        self.fi = h.FastInhib(self.msecden(xm))
++        self.fi = _FastInhib(self.msecden(xm))
+         try:
+           if params.training_inh:
+             self.fi.training = 1
+@@ -102,10 +125,10 @@
+         self.fi.tau2 = params.mt_fi_tau2
+ 
+       pc.set_gid2node(self.md_gid, pc.id())
+-      pc.cell(self.md_gid, h.NetCon(self.md, None), 1)
++      pc.cell(self.md_gid, _NetCon(self.md, None), 1)
+ 
+     if self.gpriden:
+-      self.spine = h.GranuleSpine()
++      self.spine = _GranuleSpine()
+       if gcissup(self.ggid):
+         self.spine.sup_deep_flag(1)
+       else:
+@@ -115,9 +138,9 @@
+       
+       #self.dsac = dSAC(self.ggid, self.spine)
+       
+-      self.gd = h.ThreshDetect(self.spine.head(0.5))
++      self.gd = _ThreshDetect(self.spine.head(0.5))
+       self.gd.vthresh = -50
+-      self.ampanmda = h.AmpaNmda(self.spine.head(0.5))
++      self.ampanmda = _AmpaNmda(self.spine.head(0.5))
+       if ismitral(mgid):
+         self.ampanmda.gmax = params.mc_exc_gmax
+       elif ismtufted(mgid):
+@@ -132,7 +155,7 @@
+         self.ampanmda.training = 1
+ 
+       pc.set_gid2node(self.gd_gid, pc.id())
+-      pc.cell(self.gd_gid, h.NetCon(self.gd, None), 1)
++      pc.cell(self.gd_gid, _NetCon(self.gd, None), 1)
+ 
+     # Cannot be done above because output ports must exist prior to using 
+     # an output gid as an input port on the same process.

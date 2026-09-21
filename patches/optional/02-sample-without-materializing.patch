@@ -9,7 +9,7 @@
  _MASKS = {}     # step -> which offsets are new w.r.t. the previous voxel's cube
  _BND_UP = None  # the two boundary ellipsoids, built once instead of per call
  _BND_DW = None
-@@ -98,9 +100,15 @@
+@@ -104,9 +106,15 @@
              _gran_voxel.add(p)
      old_moves = new_moves
  
@@ -26,7 +26,7 @@
    _BND_UP = misc.Ellipsoid(params.bulbCenter, params.granAxisUp)
    _BND_DW = misc.Ellipsoid(params.bulbCenter, params.granAxisDw)
  
-@@ -108,6 +116,33 @@
+@@ -114,6 +122,33 @@
  # ----------------- #
  
  
@@ -60,7 +60,7 @@
  ''' get the voxels below the segment would connect to '''
  def get_granules_below(p, glomid):
    p_up = _BND_UP.project(p)
-@@ -187,36 +222,95 @@
+@@ -193,36 +228,95 @@
  
  ''' choice a granule to connect '''
  def connect_to_granule(ci, rng, gconnected):

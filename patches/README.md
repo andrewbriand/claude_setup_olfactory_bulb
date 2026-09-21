@@ -13,12 +13,17 @@ is how you reproduce the unpatched baseline).
   so `list(set)` order, the RNG stream and the network are unchanged. Verified with
   `compare_spikes.sh` against unpatched runs. See README "Setup time" for measurements.
 
+* **03-cheaper-object-creation.patch** — memoizes `gc_is_superficial()` per granule id (pure
+  function, 96k calls at 17.7 us) and binds the HOC templates used by the synapse constructor
+  once instead of paying a 1.55 us symbol lookup per `h.<Name>` access. Synapse construction
+  1.38x faster. Bit-identical.
+
 ## Optional patches (`patches/optional/`)
 
 Not applied by default. Enable by name:
 `EXTRA_PATCHES=02-sample-without-materializing ./03_build_model.sh` (or `EXTRA_PATCHES=all`).
 
-* **02-sample-without-materializing.patch** — draws candidates by rejection sampling instead
+* **02-sample-without-materializing.patch** (generated against 01 + 03) — draws candidates by rejection sampling instead
   of building the ~981-point candidate set per connection. Quarter bulb, 4 ranks: setup
   32.0 s vs 52.3 s with patch 01 alone and 136.2 s unpatched; peak RSS drops to 3.30 GB/rank.
   **Changes the network realization** (same distribution, different draw order), so it is

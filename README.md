@@ -345,9 +345,71 @@ and 4 ranks), i.e. exactly as "valid" as running `-n 8` instead of `-n 4`, and c
 continuity with runs recorded before it — keep it off when reproducing old results, turn it on when
 setup time matters.
 
-`ThreshDetect`/NetCon construction (~9.4 us per point process) is genuine NEURON object-creation cost
-and only addressable by changing the model's design. Setup still scales ~1/n, so more ranks remain the
-cheapest lever of all.
+### NEURON object creation (patch 03, default, bit-identical)
+
+Profiling the synapse constructor (`MGRS.__init__`, ~66 us/call under cProfile) against the cost of
+the NEURON primitives it creates found two pure-Python overheads:
+
+* **`gc_is_superficial(ggid)` was 32% of the constructor**: 96,247 calls at 17.7 us, each building two
+  `Ellipsoid` objects, for a result that depends only on `ggid` (~2 calls per granule). Memoized, and
+  using the ellipsoids built once in `init()`.
+* **Every `h.<Name>` is a HOC symbol lookup costing 1.55 us** (vs 0.05 us for a bound local), and the
+  constructor did ~7 per synapse. Bound once, lazily (the `GranuleSpine` template only exists after
+  the .hoc files load).
+
+Quarter bulb, 4 ranks: synapse construction **12.9 s -> 9.4 s (1.38x)**, granule building 2.08 ->
+1.88 s, total setup 52.3 -> 47.9 s (29.3 s with the optional sampler). Spikes bit-identical.
+
+**Is there a vectorized / batch creation API that would do better?** NEURON has no bulk constructor
+for point processes or NetCons in its Python API; the closest thing is doing the loop in HOC. Measured
+(20,000 objects each, counts verified):
+
+| Object | Python, lookups hoisted | pure HOC loop | 
+|---|---|---|
+| `ThreshDetect` | 1.18 us | 0.44 us |
+| `NetCon` | 1.18 us | 0.67 us |
+| `GranuleSpine` (2 sections) | 14.04 us | **9.94 us** |
+
+A HOC batch path would save ~8 us of the ~40 us per synapse — ~20% of that phase, ~6% of setup. The
+floor is genuine C++ work, dominated by creating the spine's two sections (~10 us even with no Python
+at all). Not worth the rewrite; no object-creation change gets anywhere near 2x.
+
+### Where 2x+ still exists: ranks, and a serial floor
+
+Quarter bulb with patches 01 + 03 + optional 02, measured:
+
+| Phase | 4 ranks | 8 ranks | Scales? |
+|---|---|---|---|
+| import-time bulb geometry (every rank builds all granule positions) | 3.3 s | 3.6 s | **no** |
+| mitrals | 2.6 s | 1.3 s | yes |
+| candidate search | 10.0 s | 6.0 s | yes |
+| granules | 1.9 s | 1.0 s | yes |
+| blanes -> granule | 1.9 s | 1.0 s | yes |
+| synapse construction | 9.2 s | 5.1 s | yes |
+| **total setup** | **29.3 s** | **18.3 s** | 1.6x |
+
+Setup still scales ~1/n, so rank count is the remaining 2x lever and needs no code; the ~3.5 s of
+import-time geometry is the serial floor it runs into. With the sampler, memory is ~1.9 GB/rank at
+quarter scale, so more ranks are affordable.
+
+### Estimated full-bulb setup on the H100
+
+Per-phase speedups measured here (quarter bulb, 4 ranks: candidate search 3.98x with 01, 11.33x with
+01 + 02; synapse construction 1.38x with 03) applied to the H100's measured full-bulb phase split
+(8 ranks: search 214 s, synapses 34 s, total 263 s; 4 ranks: total 504 s):
+
+| Configuration | Search | Synapses | Other | **Setup, 4 ranks** | vs baseline | Setup, 8 ranks |
+|---|---|---|---|---|---|---|
+| baseline (unpatched) | 428 s | 67 s | 8 s | **504 s** (measured) | 1.00x | 263 s (measured) |
+| 01 | 108 s | 67 s | 8 s | 184 s | 2.75x | 103 s |
+| 01 + 03 (**default**) | 107 s | 49 s | 8 s | **165 s** | 3.06x | 93 s |
+| 01 + optional 02 | 38 s | 67 s | 8 s | 114 s | 4.43x | 68 s |
+| 01 + 03 + optional 02 | 38 s | 49 s | 8 s | **95 s** | **5.28x** | 59 s |
+
+These are estimates, not H100 measurements: the factors come from a quarter bulb on Zen 5; patch 01's
+cache-hit rate may be lower at full scale (larger per-rank working set) while the sampler does not
+depend on it; "other" is the measured remainder; and runs carry ~5% noise. Worth measuring on the H100
+with `EXTRA_PATCHES=02-sample-without-materializing`.
 
 ### The solve is host-bound, not GPU-bound
 
