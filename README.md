@@ -21,6 +21,66 @@ see [Faster spike-event delivery](#faster-spike-event-delivery-neuron-patch-02-d
 ./summarize_runs.py                                 # table + runs/summary.csv
 ```
 
+## Performance guide: what to enable
+
+After `./setup_all.sh` **everything below is on by default except the connection cache**. On an
+installation built before these changes, update and rebuild once:
+`git pull && ./02_build_neuron.sh && ./03_build_model.sh`. All of it applies to runs started through
+`run_bulb.sh` / `bench.sh` / `profile_bulb.sh`, which use the `bulb_bench.py` driver (not when running
+the model's own `bulb3dtest.py`). Every item keeps spikes bit-identical unless noted.
+
+### 1. Setup (network construction)
+
+**Load the network from the connection cache** — the big one, opt-in:
+
+```bash
+OB_CONN_CACHE=1 ./run_bulb.sh -m gpu -n 8 -t 1 -g all      # once: builds the network, writes conncache/
+OB_CONN_CACHE=1 ./run_bulb.sh -m gpu -n 1 -t 1050 -g all   # every later run, at any -n, loads it
+```
+
+This skips the candidate search (80% of unpatched setup). Quarter bulb on the 4090: 1 rank
+155.5 s -> 54 s, 4 ranks 58.5 s -> 20.2 s; estimated ~5 min instead of ~11.5 min for the full bulb on
+one H100 rank. The rank count of the first (generating) run defines the network, and every rank count
+then simulates that same network with identical spikes. Generate at a high rank count, where it is
+fast; on a RAM-limited box add `OB_NEIGHBOUR_CACHE=8192` to that run (it does not change the network).
+Delete the cache directory to regenerate. Details: "Connection cache".
+
+**Which setup patches still matter with the cache:**
+
+| Patch | Default | With the cache |
+|---|---|---|
+| `patches/03-cheaper-object-creation.patch` | on | **Still significant.** Synapse construction becomes the largest remaining phase (~30 of ~54 s at 1 rank, quarter bulb); without 03 it would be ~42 s. Keep it. |
+| `patches/01-fast-granule-candidate-search.patch` | on | Only speeds up the one-off run that generates the cache (and any run without the cache). Harmless to keep. |
+| `patches/optional/02-sample-without-materializing.patch` | off | Same as 01, faster still, but a different network realization. Not needed with the cache. |
+| `OB_NEIGHBOUR_CACHE` (patch 01's knob) | 65536 | Irrelevant when the network is loaded from the cache. |
+
+Without the cache, the default patches give ~2.3–2.8x faster setup than upstream; see "Setup and
+teardown performance".
+
+### 2. Solve time (GPU spike-event delivery)
+
+**NEURON patch `patches/nrn/02-fewer-net-receive-round-trips.patch`** — on by default, applied by
+`02_build_neuron.sh` (fewer stream syncs, one upload per receive buffer, batched NET_RECEIVE passes;
+spike-event delivery went from 66.7 to 29.5 ms per timestep). Quarter bulb, 1 rank, 4090: solver
+46.4 s -> 25.0 s. Expect a smaller gain on native Linux (H100), where GPU round trips are cheaper than
+under WSL2. To compare against the baseline on a new machine, same `-n/-t/-g` both times:
+
+```bash
+NRN_PATCHES_UPTO=01 ./02_build_neuron.sh && ./03_build_model.sh   # baseline: NVTX ranges only
+./02_build_neuron.sh && ./03_build_model.sh                        # back to the default, with patch 02
+```
+
+Details: "Faster spike-event delivery".
+
+### 3. Teardown (the minutes after the simulation ends)
+
+**Fast exit, `OB_FAST_EXIT=1`** — on by default in `bulb_bench.py`. NEURON frees network objects with an
+O(P^2) loop (`NetCvode::presyn_disconnect`), which cost ~12 min per run at 4 ranks on the H100 and never
+finished at 2. All output is written before that point, so the driver keeps the objects alive until
+the process exits and the OS reclaims the memory; NEURON's normal exit, `MPI_Finalize` included, still
+runs. Quarter bulb, 4 ranks: 18.9 s -> 1.5 s. Nothing to enable; `OB_FAST_EXIT=0` restores upstream
+behaviour. Details: "Teardown".
+
 ## Prerequisites
 
 | What | Tested with | Notes |
