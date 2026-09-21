@@ -142,7 +142,8 @@ RUN ./00_fetch_sources.sh && ./01_setup_python.sh
 COPY --chown=1000:1000 02_build_neuron.sh ./
 RUN ./02_build_neuron.sh
 
-COPY --chown=1000:1000 03_build_model.sh bulb_bench.py ./
+COPY --chown=1000:1000 03_build_model.sh bulb_bench.py profile_setup.py ./
+COPY --chown=1000:1000 patches/ ./patches/
 RUN ./03_build_model.sh
 
 COPY --chown=1000:1000 run_bulb.sh bench.sh profile_bulb.sh compare_spikes.sh \

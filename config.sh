@@ -37,4 +37,4 @@ CMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE:-Release}"
 # MPI launcher prefix; the rank count is appended. OpenMPI default below. Examples:
 #   Slurm:        MPI_LAUNCH="srun --mpi=pmix -n"
 #   MPICH/HPC-X:  MPI_LAUNCH="mpiexec -n"
-MPI_LAUNCH="${MPI_LAUNCH:-mpirun --oversubscribe -x OMP_NUM_THREADS=1 -x PYTHONPATH -x HWLOC_COMPONENTS -np}"
+MPI_LAUNCH="${MPI_LAUNCH:-mpirun --oversubscribe -x OMP_NUM_THREADS=1 -x PYTHONPATH -x HWLOC_COMPONENTS -x OB_NEIGHBOUR_CACHE -np}"

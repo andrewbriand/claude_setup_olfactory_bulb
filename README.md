@@ -57,6 +57,8 @@ bench.sh              sweeps: verify | quick | full
 compare_spikes.sh     check spike outputs of runs are identical
 summarize_runs.py     parse runs/*/run.log -> table + runs/summary.csv
 profile_bulb.sh       one nsys-profiled run -> runs/<ts>_prof_.../rank<N>.nsys-rep
+profile_setup.py      cProfile the model's network construction (CPU-only, no GPU needed)
+patches/              applied to model/ by 03_build_model.sh; upstream src/ stays pristine
 dev_rebuild.sh        incremental rebuild after editing NEURON/CoreNEURON sources
 Dockerfile            targets: `bench` (all baked in) and `dev` (toolchain only)
 
@@ -77,6 +79,8 @@ Every value can be overridden from the environment, e.g. `CUDA_ARCH=90 ./02_buil
 | `MPI_LAUNCH` | `mpirun --oversubscribe -x ... -np` | launcher prefix; e.g. `srun --mpi=pmix -n` on Slurm |
 | `PREFIX`, `VENV`, `BUILD_DIR`, `SRC_DIR` | under this directory | |
 | `EXTRA_CMAKE_ARGS` | empty | appended to the NEURON cmake line |
+| `OB_NEIGHBOUR_CACHE` | `65536` | entries in the setup speed-up cache (~19 KB each, per rank); `131072` if RAM allows, `0` disables. Read by the model at run time, not build time |
+| `NO_PATCHES` | `0` | `1` builds the model unpatched (baseline) |
 
 The NEURON build uses: `nvc`/`nvc++`/NVHPC `nvcc`, `NRN_ENABLE_CORENEURON=ON`,
 `CORENRN_ENABLE_GPU=ON` with **OpenACC** offload (`CORENRN_ENABLE_OPENMP=OFF`), MPI on,
@@ -99,7 +103,7 @@ InterViews/RxD/tests off, `Release`. CoreNEURON compile flags come out as
 |---|---|---|---|---|---|
 | `5` | 1 | 17,057 | 94,473 | 34,084 | NEURON CI test size |
 | `5,37,32,78,7` | 5 | ~46,800 | ~324,500 | 144,364 | `bulb3dtest.py` default |
-| `first:32` | 32 | 124,496 | 1,539,196 | 914,694 | ~14 GB peak host RAM at 4 ranks |
+| `first:32` | 32 | 124,496 | 1,539,196 | 914,694 | ~14 GB peak host RAM at 4 ranks (~19 GB with the default `OB_NEIGHBOUR_CACHE`) |
 | `all` | 127 | ~198,000 | 5,145,388 | 3,580,886 | needs >31 GB host RAM, see below |
 
 Every run directory has `run.log` (header with host/GPU/commits/command, full output,
@@ -224,6 +228,55 @@ and the `Ellipsoid` churn is secondary, but that is a guess.
 Per this repo's agent instructions the upstream repos are not patched here; any fix belongs on a **fork
 of olfactory-bulb-3d** (last upstream commit 2022-11-07, so a fork carries almost no rebase burden —
 unlike NEURON, which is pinned to an actively-developed master and is not where the win is anyway).
+
+### Setup time: profiled and fixed (4090, 2026-09-20) — 2.1x faster
+
+The caveat above was worth heeding: **cProfile disagreed with two of the four leads.** Measured with
+`profile_setup.py` (`first:4`, 1 rank, 85.7 s under the profiler):
+
+| Function | Calls | tottime | cumtime |
+|---|---|---|---|
+| `get_neighbors` (inside `get_granules_below`) | 1,355,558 | 36.6 s | 53.0 s |
+| `list.append` (its inner loop) | 170,326,048 | 16.5 s | — |
+| `set.update` | 1,355,566 | 8.2 s | — |
+| `get_granules_below` | 52,156 | 4.6 s | **67.6 s (79% of build)** |
+| `Ellipsoid.__init__` | 439,043 | 0.49 s | 1.17 s (**1.4%**) |
+
+* **The `Ellipsoid` churn is 1.4%, not a hotspot**, and the O(n) `del gvoxels[index]` never surfaces —
+  the list is short (~980) and `del` is C code, so the rejection loop is not where the time goes.
+* **Caching `get_granules_below` per the agent's suggestion would gain ~3%:** instrumenting the keys
+  shows only **3.6%** of its 52,156 calls repeat a voxel *path*.
+* The cost is simply generating candidate points: **1.36M voxel lookups x 125 offsets = 170M tuples**,
+  deduplicated down to ~981 points per call. But one level down, **89.3% of the voxel lookups repeat**
+  (144,764 distinct voxels out of 1,355,558) — the reuse is per *voxel*, not per path.
+
+`patches/01-fast-granule-candidate-search.patch` therefore (a) replaces the append-loop with a list
+comprehension over a hoisted offset tuple, (b) memoizes neighbours **per voxel** in a bounded
+`lru_cache`, and (c) hoists the two boundary ellipsoids (free, since they are immutable). The sequence
+of insertions into the candidate set — and hence the RNG stream and the resulting network — is
+unchanged, so results stay **bit-identical**: `bench.sh verify` passes, and spikes match the
+pre-optimization runs exactly at 1 and 5 glomeruli (51,146 / 250,166 spikes, same checksums).
+
+Quarter bulb (`first:32`), 4 ranks, total setup time and peak RSS per the `OB_NEIGHBOUR_CACHE` knob:
+
+| Cache entries | Setup (s) | Connection phase (s) | Peak RSS | vs baseline |
+|---|---|---|---|---|
+| baseline (unpatched) | 136.2 | 112.5 | 3.44 GB | — |
+| 0 (cache off, (a)+(c) only) | 113.7 | 90.8 | 3.47 GB | 1.20x |
+| 2048 | 97.3 | 73.9 | 3.49 GB | 1.40x |
+| 65536 *(default)* | 75.7 | 50.4 | 4.68 GB | 1.80x |
+| 131072 | **65.2** | 41.0 | 5.89 GB | **2.09x** |
+| 262144 | 66.5 | 41.7 | 6.51 GB | 2.05x |
+
+The knee is at ~131072 entries — that is the working set; beyond it only memory grows. The default of
+65536 (~19 KB/entry, so ~1.2 GB/rank over baseline) is a compromise for memory-constrained machines;
+**on a big-memory node set `OB_NEIGHBOUR_CACHE=131072`**. 5 glomeruli, 4 ranks: setup 24.2 s -> 15.6 s.
+
+Still unfixed and worth attacking next, in order: the remaining ~41 s connection phase (the per-call
+`set` of ~981 points is now the floor — going faster means changing the algorithm, hence the RNG stream,
+so it needs `-g` sweeps rather than checksums to validate), then `ThreshDetect` construction (~9.4 us
+per point process, a NEURON object-creation floor). Setup still scales ~1/n, so more ranks remain the
+cheapest lever.
 
 ### The solve is host-bound, not GPU-bound
 

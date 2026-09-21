@@ -1,0 +1,98 @@
+--- a/lateral_connections.py
++++ b/lateral_connections.py
+@@ -3,6 +3,27 @@
+ import misc
+ granules = params.granules
+ from gidfunc import *
++import os
++from functools import lru_cache
++
++# Speed-ups for the mitral->granule candidate search, which dominates model setup.
++# All of these keep the sequence of points inserted into `pts` below byte-identical,
++# so the RNG stream in connect_to_granule (and hence the network) is unchanged.
++# Entries in the per-voxel neighbour cache; ~19 KB each (125 tuples + overhead).
++# Setup time keeps improving up to ~131072 (the working set), then flattens; lower it
++# on memory-constrained machines, 0 disables caching. See README "Setup time".
++_NEIGHBOUR_CACHE = int(os.environ.get('OB_NEIGHBOUR_CACHE', '65536'))
++
++_OFFSETS = ()   # snapshot of _gran_voxel in its (stable) iteration order; set in init()
++_BND_UP = None  # the two boundary ellipsoids, built once instead of per call
++_BND_DW = None
++
++
++@lru_cache(maxsize=_NEIGHBOUR_CACHE)
++def _voxel_neighbours(q):
++    '''Candidate points around one voxel. 89% of lookups repeat, so cache them.'''
++    qx, qy, qz = q
++    return [(qx + dx, qy + dy, qz + dz) for dx, dy, dz in _OFFSETS]
+ 
+ # set granules type #
+ 
+@@ -56,40 +77,34 @@
+             _gran_voxel.add(p)
+     old_moves = new_moves
+ 
++  global _OFFSETS, _BND_UP, _BND_DW
++  _OFFSETS = tuple(_gran_voxel)
++  _BND_UP = misc.Ellipsoid(params.bulbCenter, params.granAxisUp)
++  _BND_DW = misc.Ellipsoid(params.bulbCenter, params.granAxisDw)
++
+ 
+ # ----------------- #
+ 
+ 
+ ''' get the voxels below the segment would connect to '''
+ def get_granules_below(p, glomid):
+-  bnd_up = misc.Ellipsoid(params.bulbCenter, params.granAxisUp)
+-  bnd_dw = misc.Ellipsoid(params.bulbCenter, params.granAxisDw)
+-  
+-  p_up = bnd_up.project(p)
+-  p_dw = bnd_dw.project(p) #params.glomRealCoords[glomid])
+-
+-  
+-
+-  def get_neighbors(q):
+-    neighpt = []
+-    for dx, dy, dz in _gran_voxel:
+-      neighpt.append((q[0]+dx, q[1]+dy, q[2]+dz))
+-    return neighpt
++  p_up = _BND_UP.project(p)
++  p_dw = _BND_DW.project(p) #params.glomRealCoords[glomid])
+ 
+-
+-  def get_p(x):
+-    d=params.gran_voxel
+-    return (int((p_dw[0]+x*(p_up[0]-p_dw[0]))/d)*d,
+-            int((p_dw[1]+x*(p_up[1]-p_dw[1]))/d)*d,
+-            int((p_dw[2]+x*(p_up[2]-p_dw[2]))/d)*d)
+-    
++  d = params.gran_voxel
++  ux = p_up[0] - p_dw[0]
++  uy = p_up[1] - p_dw[1]
++  uz = p_up[2] - p_dw[2]
+ 
+   pts = set()
+   nmoves = 1+int(misc.distance(p_up, p_dw)/params.gran_voxel)
++  step = 1.0/nmoves
+   x = 0.0
+   while x < 1:
+-    pts.update(get_neighbors(get_p(x)))
+-    x += 1.0/nmoves
++    pts.update(_voxel_neighbours((int((p_dw[0]+x*ux)/d)*d,
++                                  int((p_dw[1]+x*uy)/d)*d,
++                                  int((p_dw[2]+x*uz)/d)*d)))
++    x += step
+   return pts
+ 
+ ''' dendrites locations to connect '''
+@@ -143,8 +158,8 @@
+ 
+ ''' choice a granule to connect '''
+ def connect_to_granule(ci, rng, gconnected):
+-  up = misc.Ellipsoid(params.bulbCenter, params.granAxisUp)
+-  dw = misc.Ellipsoid(params.bulbCenter, params.granAxisDw)
++  up = _BND_UP
++  dw = _BND_DW
+   
+   gvoxels = list(get_granules_below(ci[-1], mgid2glom(ci[0])))
+ 

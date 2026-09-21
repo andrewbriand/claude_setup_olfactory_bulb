@@ -2,7 +2,10 @@
 
 Goal: build NEURON + CoreNEURON with GPU support and run the olfactory-bulb-3d model on this
 machine's GPU, then benchmark it. README.md has the full reference; this file is the procedure.
-Neither upstream repo needs modification. Do not patch them.
+Do not modify the upstream checkouts in `src/`. Model changes go in `patches/*.patch`, which
+`03_build_model.sh` applies to the `model/` copy (`NO_PATCHES=1` rebuilds the baseline); every
+patch must keep spikes bit-identical, verified with `compare_spikes.sh` against an unpatched run,
+or else document explicitly why the network legitimately changed.
 
 ## Procedure
 
@@ -30,6 +33,10 @@ Neither upstream repo needs modification. Do not patch them.
    try MPS (`nvidia-cuda-mps-control -d`) and report with/without.
 6. **Report**: `runs/summary.csv`, the GPU/CPU model, and any deviations from this procedure.
    Add new pitfalls to the "Gotchas" section of README.md.
+7. **Setup time** is ~2/3 of wall clock for big runs and is model-side Python. On a big-memory node
+   set `OB_NEIGHBOUR_CACHE=131072` (see README "Setup time"). If you optimise further, **profile
+   before believing any lead** — `profile_setup.py` needs no GPU, and cProfile already refuted two
+   plausible-looking leads that were read from the code.
 
 ## Known pitfalls (details in README "Gotchas")
 
