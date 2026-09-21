@@ -7,3 +7,4 @@ runs/
 logs/
 __pycache__/
 venv-nsys/
+conncache/

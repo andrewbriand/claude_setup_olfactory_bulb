@@ -38,9 +38,13 @@ CMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE:-Release}"
 export OB_NEIGHBOUR_CACHE="${OB_NEIGHBOUR_CACHE:-65536}"
 # 1 = skip the O(P^2) object-graph teardown at exit (see README "Setup and teardown performance"); 0 = upstream.
 export OB_FAST_EXIT="${OB_FAST_EXIT:-1}"
+# 1 = load mitral->granule connections from a rank-independent cache instead of computing them
+# (computed and saved on the first run); see conn_cache.py and README "Connection cache".
+export OB_CONN_CACHE="${OB_CONN_CACHE:-0}"
+export OB_CONN_CACHE_DIR="${OB_CONN_CACHE_DIR:-$TOP/conncache}"
 
 # ---- Launch ------------------------------------------------------------------
 # MPI launcher prefix; the rank count is appended. OpenMPI default below. Examples:
 #   Slurm:        MPI_LAUNCH="srun --mpi=pmix -n"
 #   MPICH/HPC-X:  MPI_LAUNCH="mpiexec -n"
-MPI_LAUNCH="${MPI_LAUNCH:-mpirun --oversubscribe -x OMP_NUM_THREADS=1 -x PYTHONPATH -x HWLOC_COMPONENTS -x OB_NEIGHBOUR_CACHE -x OB_FAST_EXIT -np}"
+MPI_LAUNCH="${MPI_LAUNCH:-mpirun --oversubscribe -x OMP_NUM_THREADS=1 -x PYTHONPATH -x HWLOC_COMPONENTS -x OB_NEIGHBOUR_CACHE -x OB_FAST_EXIT -x OB_CONN_CACHE -x OB_CONN_CACHE_DIR -np}"

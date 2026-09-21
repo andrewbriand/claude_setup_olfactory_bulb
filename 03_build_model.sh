@@ -11,7 +11,7 @@ source "$TOP/env.sh"
 MODEL_DIR="$TOP/model"
 rm -rf "$MODEL_DIR"
 cp -r "$SRC_DIR/olfactory-bulb-3d/sim" "$MODEL_DIR"
-cp "$TOP/bulb_bench.py" "$TOP/profile_setup.py" "$MODEL_DIR/"
+cp "$TOP/bulb_bench.py" "$TOP/profile_setup.py" "$TOP/conn_cache.py" "$MODEL_DIR/"
 
 if [ "${NO_PATCHES:-0}" != "1" ]; then
   for p in "$TOP"/patches/*.patch; do

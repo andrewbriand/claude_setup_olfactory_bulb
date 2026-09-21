@@ -60,7 +60,8 @@ document explicitly why the network legitimately changed.
 - `mpirun` hangs silently: hwloc GL plugin probing X11. `env.sh` sets `HWLOC_COMPONENTS=-gl`.
 - `NMODL_PYLIB not set` / `NMODLHOME not set` from nrnivmodl: source `env.sh` (sets both).
 - Compare spikes/timings only between runs with the same rank count (`-n`); network construction
-  depends on it.
+  depends on it — unless using the connection cache (`OB_CONN_CACHE=1`), which gives all rank counts
+  the same network. For benchmark sweeps: generate the cache once at 8+ ranks, then run any `-n`.
 - Don't use `--dump-model` + standalone `special-core`: not equivalent for this model and it
   crashes on GPU. Use `run_bulb.sh` (in-process CoreNEURON).
 - `Solver Time` is the benchmark metric; network setup (`setup_s`) is serial Python and slow.

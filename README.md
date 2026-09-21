@@ -8,7 +8,9 @@ for benchmarking.
 
 Network construction and post-run teardown used to dwarf the simulation itself. By default they are now
 ~2.3x and ~12x faster respectively, with bit-identical results; see
-[Setup and teardown performance](#setup-and-teardown-performance). The GPU solver's spike-event
+[Setup and teardown performance](#setup-and-teardown-performance). For repeated runs of the same
+network, `OB_CONN_CACHE=1` cuts setup ~2.9x more and gives every rank count the same network and
+identical spikes. The GPU solver's spike-event
 delivery makes far fewer GPU round trips per timestep (solver ~1.9x faster on the 4090, bit-identical);
 see [Faster spike-event delivery](#faster-spike-event-delivery-neuron-patch-02-default-bit-identical).
 
@@ -65,6 +67,7 @@ summarize_runs.py     parse runs/*/run.log -> table + runs/summary.csv
 profile_bulb.sh       one nsys-profiled run -> runs/<ts>_prof_.../rank<N>.nsys-rep
 analyze_nvtx.py       attribute CUDA syncs/copies/launches/MPI to CoreNEURON's NVTX phases
 gpu_roundtrip_check.cu  platform check: GPU round-trip cost vs managed memory (see "NVTX ranges")
+conn_cache.py         rank-independent cache of the network's mitral->granule connections
 profile_setup.py      cProfile the model's network construction (CPU-only, no GPU needed)
 repro_presyn_disconnect.py  standalone NEURON reproducer for the O(N^2) teardown
 patches/              applied to model/ by 03_build_model.sh; upstream src/ stays pristine
@@ -74,7 +77,7 @@ patches/nrn/          NEURON patches (NVTX; faster spike-event delivery), applie
 dev_rebuild.sh        incremental rebuild after editing NEURON/CoreNEURON sources
 Dockerfile            targets: `bench` (all baked in) and `dev` (toolchain only)
 
-src/  build/  install/  venv/  venv-nsys/  model/  runs/  logs/    generated
+src/  build/  install/  venv/  venv-nsys/  model/  runs/  logs/  conncache/    generated
 ```
 
 ## Configuration (`config.sh`)
@@ -93,6 +96,8 @@ Every value can be overridden from the environment, e.g. `CUDA_ARCH=90 ./02_buil
 | `EXTRA_CMAKE_ARGS` | empty | appended to the NEURON cmake line |
 | `OB_NEIGHBOUR_CACHE` | `65536` | entries in the setup speed-up cache (~19 KB each, per rank); `131072` if RAM allows, `0` disables. Read by the model at run time, not build time; exported by `config.sh` |
 | `OB_FAST_EXIT` | `1` | skip the O(P^2) object-graph teardown at exit (see "Setup and teardown performance"); `0` = upstream behaviour |
+| `OB_CONN_CACHE` | `0` | `1` loads mitral->granule connections from a rank-independent cache (computed and written on a miss); see "Connection cache" |
+| `OB_CONN_CACHE_DIR` | `conncache/` | where connection caches live, one subdirectory per model/glomerulus key |
 | `NO_PATCHES` | `0` | `1` builds the model unpatched (baseline) |
 | `NRN_PATCHES_UPTO` | empty (all) | `02_build_neuron.sh` applies `patches/nrn/` only up to this number, reverting later ones: `01` = NVTX only, the baseline for measuring patch 02 |
 | `NO_NRN_PATCHES` | `0` | `1` makes `02_build_neuron.sh` revert every NEURON patch (pristine NEURON) |
@@ -244,6 +249,7 @@ and the teardown fix lives in our driver, `bulb_bench.py`.
 | Cheaper NEURON object creation | `patches/03-cheaper-object-creation.patch` | **on** | synapse construction 12.9 s -> 9.4 s | bit-identical |
 | Sample candidates without building the set | `patches/optional/02-sample-without-materializing.patch` | opt-in | candidate search -> 9.8 s, *less* memory | same distribution, different network realization |
 | Fast exit (skip teardown) | `bulb_bench.py` | **on** | teardown 18.9 s -> 1.5 s | outputs byte-identical |
+| Connection cache (rank-independent) | `conn_cache.py`, `OB_CONN_CACHE=1` | opt-in | candidate search 37.3 s -> 0.14 s; setup 58.5 s -> 20.2 s (1 rank: 155.5 s -> 54 s) | cache hit reproduces the computed network exactly; one network for every rank count |
 
 **Setup, measured** (quarter bulb `first:32`, 4 ranks):
 
@@ -464,6 +470,57 @@ model size, the saving is far larger at full scale — essentially the H100's wh
 The proper fix belongs in NEURON: amortized O(1) removal (e.g. tombstone the slot and compact
 occasionally, which keeps `psl_` order unchanged) and lazily rebuilt threshold lists. That would also
 help sessions that delete and rebuild networks without exiting, which a fast exit cannot.
+
+### Connection cache: skip the candidate search entirely (opt-in, rank-independent)
+
+The candidate search's output — `model.mconnections`, per mitral gid a list of
+`(mgid, isec, xm, ggid, gisec, gx, (px, py, pz))` tuples — is all the rest of the build needs from it.
+`conn_cache.py` (hooked in from `bulb_bench.py`, upstream untouched) caches it with `OB_CONN_CACHE=1`:
+
+* **cache miss:** the search runs as usual; every rank then writes its connections, losslessly (64-bit
+  floats, original order), to `$OB_CONN_CACHE_DIR/<key>/part<rank>.npz` (default `conncache/`).
+* **cache hit:** the search is skipped; every rank reads all parts and keeps its own mitral cells'
+  connections. Cells, granules and synapses are then built from them exactly as before.
+
+The key covers the glomerulus list and the contents of the model's source and data files, so model
+patches (e.g. the optional sampler) get their own cache — but **not the rank count**. A cache generated
+at N ranks can be loaded at any rank count, which then simulates that same network. (The model's own
+`connection_file` hook has no writer any more and stores positions as 32-bit floats, so it could not
+reproduce a network exactly; hence a new format.)
+
+**Validation.** Cache miss at 4 ranks = the normally computed network (spikes identical to the unpatched
+4-rank reference); cache hit at 4 ranks = the miss run (lossless). And because the network no longer
+depends on `-n`, **spikes are identical across rank counts**: 5 glomeruli loaded at 1, 2 and 4 ranks
+(250,166 spikes, all identical); quarter bulb loaded at 1 and 4 ranks (905,597 spikes, identical).
+
+**Setup, this box** (quarter bulb; network generated once at 8 ranks):
+
+| Ranks | Computed (default patches) | Loaded from cache | Connection phase | Peak RSS/rank |
+|---|---|---|---|---|
+| 1 | 155.5 s | **54.0–54.7 s (2.9x)** | 101.7 -> 0.4 s | 12.5 -> 11.3 GB |
+| 4 | 58.5 s | **20.2 s (2.9x)** | 37.3 -> 0.14 s | 4.5 -> 3.3 GB |
+| 8 (generate, one-off) | — | 54.7 s | 41.2 s (computed + written) | 2.0 GB |
+
+At 5 glomeruli, 4 ranks: 13.1 s -> 6.7 s. What remains is object creation (synapses ~30 s at 1 rank,
+quarter bulb) plus ~24 s of cells, granules and bookkeeping.
+
+**Estimated for the H100, full bulb, 1 rank:** today's default ~690 s setup -> **~280–305 s (~5 min)**
+with the cache (search ~400 s -> ~0; synapse construction ~180 s and everything else ~90–115 s remain).
+Estimate, not measurement.
+
+**Using it** — generate once at a high rank count (fast), then run at any rank count:
+
+```bash
+OB_CONN_CACHE=1 ./run_bulb.sh -m gpu -n 8 -t 1 -g all     # computes the network and writes the cache
+OB_CONN_CACHE=1 ./run_bulb.sh -m gpu -n 1 -t 1050 -g all  # loads it (so does -n 2, 4, ...)
+```
+
+* The first run's rank count defines the network; a 1-rank run from an 8-rank cache is not the network
+  a 1-rank computation would give (it is the 8-rank one). Delete the cache directory to regenerate.
+* On a RAM-limited box, generate with a small `OB_NEIGHBOUR_CACHE` (e.g. 8192): it does not change the
+  network, only speed and memory.
+* A cache is only valid for the model files it was keyed on; changing model patches gives a new key
+  automatically. NEURON patches do not affect connectivity and are not part of the key.
 
 ### What is left after setup
 
@@ -713,7 +770,8 @@ See the container gotchas below — a dev-image run needs the host MPI bind-moun
   line is meaningless under CoreNEURON.
 * **The network depends on the MPI rank count** (5 glomeruli: 46,776 / 46,842 / 46,900 cells at
   1 / 2 / 4 ranks), because connectivity is generated per rank. It's deterministic for a given rank count.
-  Only compare spikes, and preferably timings, between runs with the same `-n`.
+  Only compare spikes, and preferably timings, between runs with the same `-n` — or use the connection
+  cache (`OB_CONN_CACHE=1`), which gives every rank count the same network and identical spikes.
 * **With 1 rank, simultaneous spikes are written in arbitrary order.** `compare_spikes.sh`
   compares sorted `(time, gid)`.
 * **Full bulb OOM at 31 GB.** Construction peaks around 30 GB at 8 ranks, and the NEURON→CoreNEURON

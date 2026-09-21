@@ -76,5 +76,10 @@ else:
 if runsim.rank == 0:
     print('bulb_bench: building %d glomeruli: %s' % (len(gloms), _gloms))
 
+# OB_CONN_CACHE=1: load the mitral->granule connections from a rank-independent cache
+# instead of running the candidate search (see conn_cache.py).
+import conn_cache
+conn_cache.install(gloms)
+
 runsim.build_part_model(gloms, [])
 runsim.run()

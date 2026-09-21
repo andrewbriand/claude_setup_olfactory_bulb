@@ -143,7 +143,7 @@ COPY --chown=1000:1000 02_build_neuron.sh ./
 COPY --chown=1000:1000 patches/nrn/ ./patches/nrn/
 RUN ./02_build_neuron.sh
 
-COPY --chown=1000:1000 03_build_model.sh bulb_bench.py profile_setup.py ./
+COPY --chown=1000:1000 03_build_model.sh bulb_bench.py profile_setup.py conn_cache.py ./
 COPY --chown=1000:1000 patches/ ./patches/
 RUN ./03_build_model.sh
 
