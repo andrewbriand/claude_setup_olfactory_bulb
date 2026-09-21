@@ -214,6 +214,17 @@ the fix is still model-side (draw less often / in bulk), not a NEURON change.
 The 33.7 s of `ThreshDetect` construction is ~9.4 us per point process — genuine NEURON object-creation
 cost, near its floor, and only addressable by changing the model's design.
 
+**Caveat: the four bullets above come from reading the code, not from a profiler.** Only the 214 s phase
+total and the ~120 us/connection unit cost are measured. Before optimising, confirm the split with
+`cProfile` on a small model — it is pure Python and needs no GPU, e.g.
+`./run_bulb.sh -m gpu -n 1 -t 1 -g first:8` with `python -m cProfile` around the construction, or simply
+time the phases at two sizes. Best guess is that the candidate-set rebuild and the O(n) delete dominate
+and the `Ellipsoid` churn is secondary, but that is a guess.
+
+Per this repo's agent instructions the upstream repos are not patched here; any fix belongs on a **fork
+of olfactory-bulb-3d** (last upstream commit 2022-11-07, so a fork carries almost no rebase burden —
+unlike NEURON, which is pinned to an actively-developed master and is not where the win is anyway).
+
 ### The solve is host-bound, not GPU-bound
 
 Trace: full bulb, 4 ranks, `tstop=20` (426 timesteps), all 4 ranks profiled. `nsys` overhead was only
