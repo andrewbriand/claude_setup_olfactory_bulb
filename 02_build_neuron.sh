@@ -13,23 +13,62 @@ export PATH="$NVHPC_ROOT/compilers/bin:$PATH"
 # Don't let a CUDA toolkit on PATH (e.g. /usr/local/cuda) be mixed with NVHPC's.
 unset CUDAHOSTCXX CUDA_HOME CUDA_PATH
 
-# NEURON patches (patches/nrn/*.patch) are applied to the src/nrn checkout, idempotently, so
-# the tree is always "pinned commit + these files" and never hand-edited. NO_NRN_PATCHES=1
-# reverse-applies any that are present. Pristine tree: git -C src/nrn checkout -- .
-for p in "$TOP"/patches/nrn/*.patch; do
-  [ -e "$p" ] || break
-  if git -C "$SRC_DIR/nrn" apply --reverse --check "$p" 2>/dev/null; then
-    if [ "${NO_NRN_PATCHES:-0}" = "1" ]; then
-      echo "reverting NEURON patch $(basename "$p")"
-      git -C "$SRC_DIR/nrn" apply --reverse "$p"
-    else
-      echo "NEURON patch already applied: $(basename "$p")"
-    fi
-  elif [ "${NO_NRN_PATCHES:-0}" != "1" ]; then
-    echo "applying NEURON patch $(basename "$p")"
-    git -C "$SRC_DIR/nrn" apply "$p"
+# NEURON patches (patches/nrn/*.patch) are applied, in order, to the src/nrn checkout, so the
+# tree is always "pinned commit + a prefix of this series" and never hand-edited. Which prefix
+# is already applied is found by comparing git trees (computed in a scratch index, without
+# touching files), and the rest are applied. NRN_PATCHES_UPTO=NN stops after patch NN (and
+# reverts later ones if present), e.g. 01 = NVTX only; NO_NRN_PATCHES=1 reverts all of them.
+# (Checking patches one by one does not work: later patches change earlier patches' context.)
+# Pristine tree: git -C src/nrn checkout -- .
+apply_nrn_patches() {
+  local nrn="$SRC_DIR/nrn" idx current applied=-1 i
+  local patches=("$TOP"/patches/nrn/*.patch)
+  [ -e "${patches[0]}" ] || patches=()
+  idx="$(mktemp)"
+  # tree of the checkout as it is now
+  GIT_INDEX_FILE="$idx" git -C "$nrn" read-tree HEAD
+  git -C "$nrn" diff --ignore-submodules --binary HEAD | GIT_INDEX_FILE="$idx" git -C "$nrn" apply --cached --allow-empty
+  current="$(GIT_INDEX_FILE="$idx" git -C "$nrn" write-tree)"
+  # trees of the pinned commit plus the first k patches
+  local trees=()
+  GIT_INDEX_FILE="$idx" git -C "$nrn" read-tree "$NRN_COMMIT"
+  trees+=("$(GIT_INDEX_FILE="$idx" git -C "$nrn" write-tree)")
+  for p in "${patches[@]}"; do
+    GIT_INDEX_FILE="$idx" git -C "$nrn" apply --cached "$p"
+    trees+=("$(GIT_INDEX_FILE="$idx" git -C "$nrn" write-tree)")
+  done
+  rm -f "$idx"
+  for i in "${!trees[@]}"; do [ "${trees[$i]}" = "$current" ] && applied=$i; done
+  if [ "$applied" -lt 0 ]; then
+    echo "src/nrn is not $NRN_COMMIT plus a prefix of patches/nrn/; refusing to patch it." >&2
+    echo "Reset with: git -C $nrn checkout --detach $NRN_COMMIT && git -C $nrn checkout -- ." >&2
+    exit 1
   fi
-done
+  # how many patches the checkout should end up with
+  local target=${#patches[@]} n
+  if [ "${NO_NRN_PATCHES:-0}" = "1" ]; then
+    target=0
+  elif [ -n "${NRN_PATCHES_UPTO:-}" ]; then
+    target=0
+    for p in "${patches[@]}"; do
+      n="$(basename "$p")"; n="${n%%-*}"
+      [ "$((10#$n))" -le "$((10#$NRN_PATCHES_UPTO))" ] && target=$((target + 1))
+    done
+  fi
+  for ((i = applied; i > target; i--)); do
+    echo "reverting NEURON patch $(basename "${patches[i - 1]}")"
+    git -C "$nrn" apply --reverse "${patches[i - 1]}"
+  done
+  for ((i = 1; i <= target; i++)); do
+    if [ "$i" -le "$applied" ]; then
+      echo "NEURON patch already applied: $(basename "${patches[i - 1]}")"
+    else
+      echo "applying NEURON patch $(basename "${patches[i - 1]}")"
+      git -C "$nrn" apply "${patches[i - 1]}"
+    fi
+  done
+}
+apply_nrn_patches
 
 mkdir -p "$BUILD_DIR" "$TOP/logs"
 echo "NVHPC: $NVHPC_ROOT | CUDA_ARCH: $CUDA_ARCH | MPI: $(command -v mpicc) | prefix: $PREFIX"

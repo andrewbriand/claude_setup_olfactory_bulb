@@ -1,0 +1,304 @@
+diff --git a/src/coreneuron/gpu/nrn_acc_manager.cpp b/src/coreneuron/gpu/nrn_acc_manager.cpp
+index 63c5993bf..c16cf93d7 100644
+--- a/src/coreneuron/gpu/nrn_acc_manager.cpp
++++ b/src/coreneuron/gpu/nrn_acc_manager.cpp
+@@ -35,6 +35,7 @@
+ #include <cstring>
+ 
+ #include "coreneuron/utils/memory.h"
++#include "coreneuron/mechanism/membfunc.hpp"
+ 
+ #if __has_include(<cxxabi.h>)
+ #define USE_CXXABI
+@@ -429,6 +430,11 @@ static Memb_list* copy_ml_to_device(const Memb_list* ml, int type) {
+ 
+         d_dptr = cnrn_target_copyin(nsb->_nsb_flag, nsb->_size);
+         cnrn_target_memcpy_to_device(&(d_nsb->_nsb_flag), &d_dptr);
++
++        // pinned host slot for the asynchronous count copy (net_buf_receive_all)
++        auto const code = cudaMallocHost(&nsb->_cnt_host, sizeof(int));
++        assert(code == cudaSuccess);
++        *nsb->_cnt_host = 0;
+     }
+ 
+     return d_ml;
+@@ -488,6 +494,11 @@ static void delete_ml_from_device(Memb_list* ml, int type) {
+     {
+         NetSendBuffer_t* nsb{ml->_net_send_buffer};
+         if (nsb) {
++            if (nsb->_cnt_host) {
++                auto const code = cudaFreeHost(nsb->_cnt_host);
++                assert(code == cudaSuccess);
++                nsb->_cnt_host = nullptr;
++            }
+             cnrn_target_delete(nsb->_nsb_flag, nsb->_size);
+             cnrn_target_delete(nsb->_nsb_t, nsb->_size);
+             cnrn_target_delete(nsb->_weight_index, nsb->_size);
+@@ -1020,7 +1031,81 @@ void update_net_receive_buffer(NrnThread* nt) {
+             }
+         }
+     }
+-    nrn_pragma_acc(wait(nt->stream_id))
++    // No wait here: net_buf_receive_all() launches the NET_RECEIVE kernels behind these copies
++    // on the same stream and then waits once, before the host touches the buffers again.
++}
++
++void net_send_buffer_count_to_host_async(NrnThread* nt, NetSendBuffer_t* nsb) {
++#ifdef CORENEURON_ENABLE_GPU
++    if (nt->compute_gpu) {
++#if !defined(CORENEURON_PREFER_OPENMP_OFFLOAD) && defined(_OPENACC)
++        NetSendBuffer_t* const d_nsb = cnrn_target_deviceptr(nsb);
++        auto const code = cudaMemcpyAsync(nsb->_cnt_host,
++                                          &(d_nsb->_cnt),
++                                          sizeof(int),
++                                          cudaMemcpyDeviceToHost,
++                                          static_cast<cudaStream_t>(
++                                              acc_get_cuda_stream(nt->stream_id)));
++        assert(code == cudaSuccess);
++#else
++        nrn_pragma_omp(target update from(nsb->_cnt))
++        *nsb->_cnt_host = nsb->_cnt;
++#endif
++    }
++#else
++    static_cast<void>(nt);
++    static_cast<void>(nsb);
++#endif
++}
++
++void net_send_buffer_count_clear(NrnThread* nt, NetSendBuffer_t* nsb) {
++    if (nt->compute_gpu && nsb->_cnt_host) {
++        *nsb->_cnt_host = 0;
++    }
++}
++
++int net_send_buffer_count_on_host(NrnThread* nt, NetSendBuffer_t* nsb) {
++    if (nt->compute_gpu && nsb->_cnt_host) {
++        return *nsb->_cnt_host;
++    }
++    return nsb->_cnt;
++}
++
++void net_buf_receive_all(NrnThread* nt) {
++    auto const& net_buf_receive = corenrn.get_net_buf_receive();
++    auto const finish = [nt](auto const& f) {
++        std::string name("net-buf-receive-");
++        name += nrn_get_mechname(f.second);
++        Instrumentor::phase p(name.c_str());
++        (*f.first)(nt);
++    };
++    if (!nt->compute_gpu) {
++        nt->_net_buf_receive_phase = NRN_NET_BUF_RECEIVE_ALL;
++        for (auto const& f: net_buf_receive) {
++            finish(f);
++        }
++        return;
++    }
++    // Launch every mechanism's NET_RECEIVE kernel (and the copy of its send-buffer count)
++    // back to back, wait once, then move sent events to the host in the original mechanism
++    // order. The kernels run in the same order on the same stream as before, and no kernel
++    // depends on another mechanism's host-side processing, so results are unchanged.
++    nt->_net_buf_receive_phase = NRN_NET_BUF_RECEIVE_LAUNCH;
++    {
++        Instrumentor::phase p("net-buf-receive-launch");
++        for (auto const& f: net_buf_receive) {
++            (*f.first)(nt);
++        }
++    }
++    {
++        Instrumentor::phase p("net-buf-receive-wait");
++        nrn_pragma_acc(wait(nt->stream_id))
++    }
++    nt->_net_buf_receive_phase = NRN_NET_BUF_RECEIVE_FINISH;
++    for (auto const& f: net_buf_receive) {
++        finish(f);
++    }
++    nt->_net_buf_receive_phase = NRN_NET_BUF_RECEIVE_ALL;
+ }
+ 
+ void update_net_send_buffer_on_host(NrnThread* nt, NetSendBuffer_t* nsb) {
+diff --git a/src/coreneuron/gpu/nrn_acc_manager.hpp b/src/coreneuron/gpu/nrn_acc_manager.hpp
+index 5a2a6f544..f77e3340d 100644
+--- a/src/coreneuron/gpu/nrn_acc_manager.hpp
++++ b/src/coreneuron/gpu/nrn_acc_manager.hpp
+@@ -16,6 +16,15 @@ void delete_nrnthreads_on_device(NrnThread* threads, int nthreads);
+ void update_nrnthreads_on_host(NrnThread* threads, int nthreads);
+ 
+ void update_net_receive_buffer(NrnThread* _nt);
++/** Run every mechanism's net_buf_receive. On GPU: launch all their NET_RECEIVE kernels, wait on
++ *  the stream once, then move each mechanism's sent events to the host (same order as before). */
++void net_buf_receive_all(NrnThread* nt);
++/** Queue a copy of nsb's device-side count into pinned host memory on nt's stream (GPU). */
++void net_send_buffer_count_to_host_async(NrnThread* nt, NetSendBuffer_t* nsb);
++/** Record that no NET_RECEIVE kernel ran for nsb's mechanism this pass (count is 0). */
++void net_send_buffer_count_clear(NrnThread* nt, NetSendBuffer_t* nsb);
++/** nsb's count after the last NET_RECEIVE pass; on GPU valid once the stream was waited on. */
++int net_send_buffer_count_on_host(NrnThread* nt, NetSendBuffer_t* nsb);
+ 
+ // Called by NModl
+ void realloc_net_receive_buffer(NrnThread* nt, Memb_list* ml);
+diff --git a/src/coreneuron/mechanism/mechanism.hpp b/src/coreneuron/mechanism/mechanism.hpp
+index 7b9c79a60..e4d289885 100644
+--- a/src/coreneuron/mechanism/mechanism.hpp
++++ b/src/coreneuron/mechanism/mechanism.hpp
+@@ -81,6 +81,9 @@ struct NetSendBuffer_t: MemoryManaged {
+     int _cnt;
+     int _size;       /* capacity */
+     int reallocated; /* if buffer resized/reallocated, needs to be copy to cpu */
++    /* GPU runs: pinned host slot that the device-side _cnt is copied into asynchronously, so
++     * that several mechanisms' counts arrive with one stream wait (net_buf_receive_all). */
++    int* _cnt_host = nullptr;
+ 
+     NetSendBuffer_t(int size)
+         : _size(size) {
+diff --git a/src/coreneuron/network/cvodestb.cpp b/src/coreneuron/network/cvodestb.cpp
+index bd3de5f4c..9da3d3dbf 100644
+--- a/src/coreneuron/network/cvodestb.cpp
++++ b/src/coreneuron/network/cvodestb.cpp
+@@ -38,10 +38,7 @@ void nrn_deliver_events(NrnThread* nt) {
+ 
+     /*before executing on gpu, we have to update the NetReceiveBuffer_t on GPU */
+     update_net_receive_buffer(nt);
+-
+-    for (auto& net_buf_receive: corenrn.get_net_buf_receive()) {
+-        (*net_buf_receive.first)(nt);
+-    }
++    net_buf_receive_all(nt);
+ }
+ 
+ void clear_event_queue() {
+diff --git a/src/coreneuron/network/netcvode.cpp b/src/coreneuron/network/netcvode.cpp
+index 3170fc71b..f30c651f3 100644
+--- a/src/coreneuron/network/netcvode.cpp
++++ b/src/coreneuron/network/netcvode.cpp
+@@ -678,12 +678,6 @@ tryagain:
+ 
+     /*before executing on gpu, we have to update the NetReceiveBuffer_t on GPU */
+     update_net_receive_buffer(nt);
+-
+-    for (auto& net_buf_receive: corenrn.get_net_buf_receive()) {
+-        std::string ss("net-buf-receive-");
+-        ss += nrn_get_mechname(net_buf_receive.second);
+-        Instrumentor::phase p_net_buf_receive(ss.c_str());
+-        (*net_buf_receive.first)(nt);
+-    }
++    net_buf_receive_all(nt);
+ }
+ }  // namespace coreneuron
+diff --git a/src/coreneuron/sim/multicore.hpp b/src/coreneuron/sim/multicore.hpp
+index 27d6569a5..681a43290 100644
+--- a/src/coreneuron/sim/multicore.hpp
++++ b/src/coreneuron/sim/multicore.hpp
+@@ -72,6 +72,15 @@ struct PreSynHelper {
+     int flag_;
+ };
+ 
++/* Values of NrnThread::_net_buf_receive_phase. With ALL, a mechanism's net_buf_receive runs its
++ * whole pass (launch, wait, move sent events to the host). On GPU, net_buf_receive_all() instead
++ * calls every mechanism with LAUNCH, waits on the stream once, then calls them with FINISH. */
++enum : int {
++    NRN_NET_BUF_RECEIVE_ALL = 0,
++    NRN_NET_BUF_RECEIVE_LAUNCH = 1,
++    NRN_NET_BUF_RECEIVE_FINISH = 2,
++};
++
+ struct NrnThread: public MemoryManaged {
+     double _t = 0;
+     double _dt = -1e9;
+@@ -135,6 +144,8 @@ struct NrnThread: public MemoryManaged {
+     int shadow_rhs_cnt = 0; /* added to facilitate the NrnThread transfer to GPU */
+     int compute_gpu = 0;    /* define whether to compute with gpus */
+     int stream_id = 0;      /* define where the kernel will be launched on GPU stream */
++    /* which part of each mechanism's net_buf_receive to run, see NRN_NET_BUF_RECEIVE_* */
++    int _net_buf_receive_phase = 0;
+     int _net_send_buffer_size = 0;
+     int _net_send_buffer_cnt = 0;
+     int* _net_send_buffer = nullptr;
+diff --git a/src/nmodl/codegen/codegen_coreneuron_cpp_visitor.cpp b/src/nmodl/codegen/codegen_coreneuron_cpp_visitor.cpp
+index e1049ee14..5ef623e30 100644
+--- a/src/nmodl/codegen/codegen_coreneuron_cpp_visitor.cpp
++++ b/src/nmodl/codegen/codegen_coreneuron_cpp_visitor.cpp
+@@ -2368,16 +2368,25 @@ void CodegenCoreneuronCppVisitor::print_net_receive_buffering(bool need_mech_ins
+ 
+     print_get_memb_list();
+ 
++    const auto& net_receive = method_name("net_receive_kernel");
++    const bool moves_send_events = info.net_send_used || info.net_event_used;
++
++    // The function runs in phases selected by nt->_net_buf_receive_phase. ALL is the whole pass
++    // (launch, wait, move sent events to the host). On GPU, net_buf_receive_all() calls every
++    // mechanism with LAUNCH, waits on the stream once, and then calls them with FINISH.
++    printer->push_block("if (nt->_net_buf_receive_phase != NRN_NET_BUF_RECEIVE_FINISH)");
++
+     // Nothing was delivered to this mechanism: the kernel would run zero iterations, and the
+     // send buffer is empty on entry (INITIAL and WATCH drain theirs before returning), so skip
+     // the launch, the waits and the send-buffer round trip. This happens for most mechanisms on
+     // most timesteps. Checked before the data region, which a return may not leave.
+     printer->push_block("if (ml->_net_receive_buffer->_displ_cnt == 0)");
++    if (moves_send_events) {
++        printer->add_line("net_send_buffer_count_clear(nt, ml->_net_send_buffer);");
++    }
+     printer->add_line("return;");
+     printer->pop_block();
+ 
+-    const auto& net_receive = method_name("net_receive_kernel");
+-
+     print_kernel_data_present_annotation_block_begin();
+ 
+     printer->add_line("NetReceiveBuffer_t* nrb = ml->_net_receive_buffer;");
+@@ -2400,20 +2409,47 @@ void CodegenCoreneuronCppVisitor::print_net_receive_buffering(bool need_mech_ins
+     printer->pop_block();
+     print_net_receive_loop_end();
+ 
+-    // print_send_event_move() begins with its own wait on the stream, so only wait here when
+-    // it is not generated (the second, back-to-back wait was a redundant synchronization).
+-    const bool moves_send_events = info.net_send_used || info.net_event_used;
+-    if (!moves_send_events) {
+-        print_device_stream_wait();
+-    }
+     printer->add_line("nrb->_displ_cnt = 0;");
+     printer->add_line("nrb->_cnt = 0;");
+-
+     if (moves_send_events) {
+-        print_send_event_move();
++        // queued behind the kernel on its stream; read in the finish part, after a wait
++        printer->add_line("net_send_buffer_count_to_host_async(nt, ml->_net_send_buffer);");
+     }
+ 
+     print_kernel_data_present_annotation_block_end();
++
++    printer->push_block("if (nt->_net_buf_receive_phase == NRN_NET_BUF_RECEIVE_LAUNCH)");
++    printer->add_line("return;");
++    printer->pop_block();
++    print_device_stream_wait();
++    printer->pop_block();
++
++    if (moves_send_events) {
++        // Finish: move what the kernel sent to the host event queue. The device count only
++        // needs resetting if it was non-zero; the reset is a synchronous host-to-device copy.
++        printer->add_newline();
++        printer->add_line("NetSendBuffer_t* nsb = ml->_net_send_buffer;");
++        printer->add_line("int const nsb_cnt = net_send_buffer_count_on_host(nt, nsb);");
++        printer->push_block("if (nsb_cnt)");
++        printer->add_line("nsb->_cnt = nsb_cnt;");
++        printer->add_line("update_net_send_buffer_on_host(nt, nsb);");
++        printer->push_block("for (int i=0; i < nsb->_cnt; i++)");
++        printer->add_multi_line(R"CODE(
++            int type = nsb->_sendtype[i];
++            int tid = nt->id;
++            double t = nsb->_nsb_t[i];
++            double flag = nsb->_nsb_flag[i];
++            int vdata_index = nsb->_vdata_index[i];
++            int weight_index = nsb->_weight_index[i];
++            int point_index = nsb->_pnt_index[i];
++            net_sem_from_gpu(type, vdata_index, weight_index, tid, point_index, t, flag);
++        )CODE");
++        printer->pop_block();
++        printer->add_line("nsb->_cnt = 0;");
++        print_net_send_buf_count_update_to_device();
++        printer->pop_block();
++    }
++
+     printer->pop_block();
+ }
+ 

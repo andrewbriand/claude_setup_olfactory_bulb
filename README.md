@@ -8,7 +8,9 @@ for benchmarking.
 
 Network construction and post-run teardown used to dwarf the simulation itself. By default they are now
 ~2.3x and ~12x faster respectively, with bit-identical results; see
-[Setup and teardown performance](#setup-and-teardown-performance).
+[Setup and teardown performance](#setup-and-teardown-performance). The GPU solver's spike-event
+delivery makes ~40% fewer GPU round trips per timestep (solver ~2x faster on the 4090, bit-identical);
+see [Faster spike-event delivery](#faster-spike-event-delivery-neuron-patches-0205-default-bit-identical).
 
 ```bash
 ./setup_all.sh               # fetch -> venv -> build NEURON -> build model -> verify  (~15 min)
@@ -67,7 +69,8 @@ profile_setup.py      cProfile the model's network construction (CPU-only, no GP
 repro_presyn_disconnect.py  standalone NEURON reproducer for the O(N^2) teardown
 patches/              applied to model/ by 03_build_model.sh; upstream src/ stays pristine
 patches/optional/     opt-in, enabled with EXTRA_PATCHES=<name> (changes results; see below)
-patches/nrn/          NEURON patches, applied to the src/nrn checkout by 02_build_neuron.sh
+patches/nrn/          NEURON patches (NVTX; faster spike-event delivery), applied in order to the
+                      src/nrn checkout by 02_build_neuron.sh
 dev_rebuild.sh        incremental rebuild after editing NEURON/CoreNEURON sources
 Dockerfile            targets: `bench` (all baked in) and `dev` (toolchain only)
 
@@ -91,7 +94,8 @@ Every value can be overridden from the environment, e.g. `CUDA_ARCH=90 ./02_buil
 | `OB_NEIGHBOUR_CACHE` | `65536` | entries in the setup speed-up cache (~19 KB each, per rank); `131072` if RAM allows, `0` disables. Read by the model at run time, not build time; exported by `config.sh` |
 | `OB_FAST_EXIT` | `1` | skip the O(P^2) object-graph teardown at exit (see "Setup and teardown performance"); `0` = upstream behaviour |
 | `NO_PATCHES` | `0` | `1` builds the model unpatched (baseline) |
-| `NO_NRN_PATCHES` | `0` | `1` makes `02_build_neuron.sh` reverse-apply `patches/nrn/*.patch` (currently: NVTX ranges) |
+| `NRN_PATCHES_UPTO` | empty (all) | `02_build_neuron.sh` applies `patches/nrn/` only up to this number, reverting later ones: `01` = NVTX only, the baseline for measuring 02–05 |
+| `NO_NRN_PATCHES` | `0` | `1` makes `02_build_neuron.sh` revert every NEURON patch (pristine NEURON) |
 | `EXTRA_PATCHES` | empty | opt-in patches from `patches/optional/` by name, or `all` |
 
 The NEURON build uses: `nvc`/`nvc++`/NVHPC `nvcc`, `NRN_ENABLE_CORENEURON=ON`,
@@ -540,8 +544,9 @@ the phase launched:
 Profile **one rank** unless MPS is running: with several ranks time-slicing one GPU, waits in one
 rank include other ranks' kernels, and the attribution becomes misleading.
 
-**What the solver's timestep is made of** (this box, 1 rank; counts are per timestep and do not
-change with model size, 5 glomeruli vs quarter bulb):
+**What the solver's timestep is made of** before patches 02–05 (this box, 1 rank; counts are per
+timestep and do not change with model size, 5 glomeruli vs quarter bulb). The next section shows
+what 02–05 changed:
 
 | Phase | Syncs | Device->host copies | Host->device copies | Launches |
 |---|---|---|---|---|
@@ -585,6 +590,87 @@ WSL2, trust the per-step *counts* above but not the times. Check any machine wit
 ```bash
 source env.sh && nvcc -O2 -arch=sm_${CUDA_ARCH} gpu_roundtrip_check.cu -o runs/gpu_roundtrip_check && runs/gpu_roundtrip_check
 ```
+
+### Faster spike-event delivery (NEURON patches 02–05, default, bit-identical)
+
+`deliver-events` was 54–65% of every timestep. It runs twice per step (at t and t+dt/2), and each time
+the host fills per-mechanism receive buffers, uploads them, and runs each synaptic mechanism's
+NET_RECEIVE pass: launch a kernel, wait, copy the mechanism's send-buffer count back, reset it. Four
+patches in `patches/nrn/` cut the round trips. Patches 02, 03 and 05 change the NMODL code generator
+(`src/nmodl/codegen/codegen_coreneuron_cpp_visitor.cpp`), so the mechanism code is regenerated at
+model build time; 04 and 05 change CoreNEURON.
+
+| Patch | Change | Why it is safe |
+|---|---|---|
+| `02-skip-empty-net-receive-passes` | Return immediately from a mechanism's pass when nothing was delivered to it. Measured before: only ~2.5 of the 8 passes per step have events (`orn`: 1–10%). | With no events the kernel runs zero iterations, and the send buffer is provably empty on entry: every other writer (INITIAL, WATCH) drains it before returning. |
+| `03-fewer-net-receive-syncs` | Drop a second, back-to-back stream wait; reset the device-side send count only when it was non-zero. | The duplicate wait had nothing to wait for; a zero count is already zero on the device. |
+| `04-single-copy-net-receive-buffer` | A receive buffer's six arrays become rows of one block (pinned in GPU runs) with the same layout on the device, so each upload is one `cudaMemcpy2DAsync` of the used prefix of every row instead of eight copies. | Same bytes arrive. The per-pass `_cnt`/`_displ_cnt` uploads are dropped: the kernel takes its loop bound from the host, and nothing on the device reads them. |
+| `05-batch-net-receive-passes` | Launch every mechanism's kernel back to back, queue each send count into pinned host memory, wait **once**, then move sent events to the host in the original mechanism order (`net_buf_receive_all()`, driven by `NrnThread::_net_buf_receive_phase`). CPU runs keep the old whole-pass path. | Kernels run in the same order on the same stream; no kernel depends on another mechanism's host-side processing; host processing order is unchanged. |
+
+**Validation.** After every patch: `bench.sh verify` (NEURON = CoreNEURON-CPU = CoreNEURON-GPU),
+the 4-rank GPU run against the unpatched reference, and **every** timing run below against the
+matching unpatched 1-rank run — all bit-identical (5 glomeruli: 250,317 spikes; quarter bulb: 906,756).
+Patch 04 rewrote the buffer-growth path, which never triggers at the default capacity, so it was
+stress-tested separately: buffers started at capacity 8 (growth confirmed with a `gdb` breakpoint,
+hit from `ThreshDetect` event delivery during the solve) and all checks were still identical. The
+OpenMP-offload code paths compile in the OpenACC build but were not run.
+
+**Speed on the 4090** (1 rank, WSL2; solver time, median of 5 runs at 5 glomeruli / 3 at quarter bulb):
+
+| Build | 5 glomeruli, 50 ms | Quarter bulb, 20 ms |
+|---|---|---|
+| baseline (NVTX only, `NRN_PATCHES_UPTO=01`) | 18.2 s (16.8–19.1) | 46.4 s (45.7–57.2) |
+| **all patches (default)** | **9.35 s** (8.0–10.0) | **21.1 s** (19.0–22.8) |
+| speedup | **1.95x** | **2.20x** |
+
+Per-patch progression during development (3 runs at 5 glomeruli, 1–3 at quarter bulb; indicative only):
+
+| Applied | 5 glomeruli (median) | Quarter bulb |
+|---|---|---|
+| 02 | 11.4 s | 20.6 s |
+| 02–03 | 12.0 s | 22.0 s |
+| 02–04 | 12.3 s | 22.9 s (22.1, 22.9, 35.2) |
+| 02–05 | 8.2 s | 17.7 s (17.6, 17.7, 22.3) |
+
+Patch 02 carries most of the gain and 05 adds a further step. 03 and 04 are within this box's noise,
+which is large: the 02–05 row and the final row are the *same code* measured at different times, and
+single runs can be off by 50% (the 35.2 s and 57.2 s values). 04 was expected to be neutral here —
+host-to-device copies cost ~11 µs on this platform — and to matter only where API calls, not the
+WSL2 managed-memory tax, dominate.
+
+**Per timestep** (quarter bulb, 1 rank, `analyze_nvtx.py` on nsys traces; counts do not depend on the
+platform):
+
+| | Baseline | All patches |
+|---|---|---|
+| stream syncs | 67.3 | **41.6** |
+| kernel launches | 39.0 | 33.6 |
+| device -> host copies | 22.0 | 18.0 |
+| host -> device copies | 20.4 | **5.0** |
+| other CUDA calls | 15.7 | 11.6 |
+| `deliver-events`, ms (under nsys) | 66.7 | **24.9** |
+| whole timestep, ms (under nsys) | 124.6 | 71.2 |
+
+Traces: `runs/20260920-232127_prof_np1_t20_gfirst-32/` (baseline) and
+`runs/20260921-014519_prof_np1_t20_gfirst-32/` (all patches), each with `rank0.phases.txt`.
+NVTX note: with patch 05, launches appear under `net-buf-receive-launch`, the single wait under
+`net-buf-receive-wait`, and `net-buf-receive-<mechanism>` holds only moving sent events to the host;
+both delivery passes per step now have these ranges (before, only the first did).
+
+**Expect less on the H100.** On WSL2 every removed round trip also removes a managed-memory charge
+(0.3–1 ms at quarter scale, see "NVTX ranges" above), which native Linux does not pay. The removed
+*counts* — ~26 syncs, ~5 launches and ~19 copies per step — carry over; their value there is
+native round-trip cost x count. To measure it on the H100:
+
+```bash
+NRN_PATCHES_UPTO=01 ./02_build_neuron.sh && ./03_build_model.sh   # baseline (NVTX only)
+./02_build_neuron.sh && ./03_build_model.sh                        # all patches
+```
+
+**What is left in `deliver-events`:** `check-threshold` is now its largest part (12.5 of 24.9 ms,
+8.2 syncs and 7.7 device->host copies per step): spike detection and `ThreshDetect`'s WATCH check,
+each copying counts and entries back separately. It is the natural next target, together with
+replacing `ThreshDetect`'s WATCH -> self-event -> `net_event` chain in the model.
 
 ## Container
 

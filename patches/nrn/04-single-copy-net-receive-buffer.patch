@@ -1,0 +1,351 @@
+diff --git a/src/coreneuron/gpu/nrn_acc_manager.cpp b/src/coreneuron/gpu/nrn_acc_manager.cpp
+index 1fcc59478..63c5993bf 100644
+--- a/src/coreneuron/gpu/nrn_acc_manager.cpp
++++ b/src/coreneuron/gpu/nrn_acc_manager.cpp
+@@ -28,9 +28,13 @@
+ #include <pat_api.h>
+ #endif
+ 
+-#if defined(CORENEURON_ENABLE_GPU) && defined(CORENEURON_PREFER_OPENMP_OFFLOAD) && defined(_OPENMP)
++#ifdef CORENEURON_ENABLE_GPU
+ #include <cuda_runtime_api.h>
+ #endif
++#include <cassert>
++#include <cstring>
++
++#include "coreneuron/utils/memory.h"
+ 
+ #if __has_include(<cxxabi.h>)
+ #define USE_CXXABI
+@@ -88,6 +92,92 @@ bool cnrn_target_enable_debug{cnrn_target_debug_output_enabled()};
+ }  // namespace
+ 
+ namespace coreneuron {
++
++// NetReceiveBuffer_t rows: the six arrays are rows of one block with a common pitch, so that
++// the used prefix of all of them reaches the GPU in one 2D copy (update_net_receive_buffer).
++namespace {
++enum : int {
++    nrb_row_t,
++    nrb_row_flag,
++    nrb_row_pnt_index,
++    nrb_row_weight_index,
++    nrb_row_displ,
++    nrb_row_nrb_index,
++    nrb_nrows
++};
++}  // namespace
++
++void nrn_net_receive_buffer_alloc(NetReceiveBuffer_t* nrb, int size) {
++    // Every row holds at most size + 1 elements of at most 8 bytes; keep rows 64-byte aligned.
++    std::size_t const pitch = ((size + 1) * sizeof(double) + 63) / 64 * 64;
++    std::size_t const bytes = nrb_nrows * pitch;
++    void* rows{};
++    int pinned{};
++#ifdef CORENEURON_ENABLE_GPU
++    if (gpu_enabled()) {
++        // Pinned, so that the per-timestep upload is a true asynchronous copy.
++        auto const code = cudaMallocHost(&rows, bytes);
++        assert(code == cudaSuccess);
++        std::memset(rows, 0, bytes);
++        pinned = 1;
++    }
++#endif
++    if (!rows) {
++        rows = ecalloc_align(bytes, 1);
++    }
++    auto* const base = static_cast<char*>(rows);
++    nrb->_rows = rows;
++    nrb->_row_pitch = pitch;
++    nrb->_rows_pinned = pinned;
++    nrb->_size = size;
++    nrb->_nrb_t = reinterpret_cast<double*>(base + nrb_row_t * pitch);
++    nrb->_nrb_flag = reinterpret_cast<double*>(base + nrb_row_flag * pitch);
++    nrb->_pnt_index = reinterpret_cast<int*>(base + nrb_row_pnt_index * pitch);
++    nrb->_weight_index = reinterpret_cast<int*>(base + nrb_row_weight_index * pitch);
++    nrb->_displ = reinterpret_cast<int*>(base + nrb_row_displ * pitch);
++    nrb->_nrb_index = reinterpret_cast<int*>(base + nrb_row_nrb_index * pitch);
++}
++
++void nrn_net_receive_buffer_free(NetReceiveBuffer_t* nrb) {
++    if (!nrb->_rows) {
++        return;
++    }
++#ifdef CORENEURON_ENABLE_GPU
++    if (nrb->_rows_pinned) {
++        auto const code = cudaFreeHost(nrb->_rows);
++        assert(code == cudaSuccess);
++    } else
++#endif
++    {
++        free_memory(nrb->_rows);
++    }
++    nrb->_rows = nullptr;
++    nrb->_nrb_t = nrb->_nrb_flag = nullptr;
++    nrb->_pnt_index = nrb->_weight_index = nrb->_displ = nrb->_nrb_index = nullptr;
++}
++
++#ifdef CORENEURON_ENABLE_GPU
++/* Map nrb's row block onto the device (same layout) and point the device struct's array
++ * members at the device rows. */
++static void net_receive_buffer_rows_to_device(NetReceiveBuffer_t* nrb, NetReceiveBuffer_t* d_nrb) {
++    char* const d_rows = cnrn_target_copyin(static_cast<char*>(nrb->_rows),
++                                            nrb_nrows * nrb->_row_pitch);
++    auto const row = [d_rows, pitch = nrb->_row_pitch](int i) { return d_rows + i * pitch; };
++    double* d_dbl = reinterpret_cast<double*>(row(nrb_row_t));
++    cnrn_target_memcpy_to_device(&(d_nrb->_nrb_t), &d_dbl);
++    d_dbl = reinterpret_cast<double*>(row(nrb_row_flag));
++    cnrn_target_memcpy_to_device(&(d_nrb->_nrb_flag), &d_dbl);
++    int* d_int = reinterpret_cast<int*>(row(nrb_row_pnt_index));
++    cnrn_target_memcpy_to_device(&(d_nrb->_pnt_index), &d_int);
++    d_int = reinterpret_cast<int*>(row(nrb_row_weight_index));
++    cnrn_target_memcpy_to_device(&(d_nrb->_weight_index), &d_int);
++    d_int = reinterpret_cast<int*>(row(nrb_row_displ));
++    cnrn_target_memcpy_to_device(&(d_nrb->_displ), &d_int);
++    d_int = reinterpret_cast<int*>(row(nrb_row_nrb_index));
++    cnrn_target_memcpy_to_device(&(d_nrb->_nrb_index), &d_int);
++}
++#endif
++
+ extern InterleaveInfo* interleave_info;
+ void nrn_ion_global_map_copyto_device();
+ void nrn_ion_global_map_delete_from_device();
+@@ -308,24 +398,7 @@ static Memb_list* copy_ml_to_device(const Memb_list* ml, int type) {
+     if (nrb) {
+         NetReceiveBuffer_t* d_nrb = cnrn_target_copyin(nrb);
+         cnrn_target_memcpy_to_device(&(d_ml->_net_receive_buffer), &d_nrb);
+-
+-        int* d_pnt_index = cnrn_target_copyin(nrb->_pnt_index, nrb->_size);
+-        cnrn_target_memcpy_to_device(&(d_nrb->_pnt_index), &d_pnt_index);
+-
+-        int* d_weight_index = cnrn_target_copyin(nrb->_weight_index, nrb->_size);
+-        cnrn_target_memcpy_to_device(&(d_nrb->_weight_index), &d_weight_index);
+-
+-        double* d_nrb_t = cnrn_target_copyin(nrb->_nrb_t, nrb->_size);
+-        cnrn_target_memcpy_to_device(&(d_nrb->_nrb_t), &d_nrb_t);
+-
+-        double* d_nrb_flag = cnrn_target_copyin(nrb->_nrb_flag, nrb->_size);
+-        cnrn_target_memcpy_to_device(&(d_nrb->_nrb_flag), &d_nrb_flag);
+-
+-        int* d_displ = cnrn_target_copyin(nrb->_displ, nrb->_size + 1);
+-        cnrn_target_memcpy_to_device(&(d_nrb->_displ), &d_displ);
+-
+-        int* d_nrb_index = cnrn_target_copyin(nrb->_nrb_index, nrb->_size);
+-        cnrn_target_memcpy_to_device(&(d_nrb->_nrb_index), &d_nrb_index);
++        net_receive_buffer_rows_to_device(nrb, d_nrb);
+     }
+ 
+     /* copy NetSendBuffer_t on to GPU */
+@@ -386,20 +459,18 @@ static void update_ml_on_host(const Memb_list* ml, int type) {
+ 
+     auto nrb = ml->_net_receive_buffer;
+ 
++    // _cnt and _displ_cnt are written only on the host (the per-pass upload does not copy
++    // them), so the host values are authoritative and are not copied back.
+     // clang-format off
+-    nrn_pragma_acc(update self(nrb->_cnt,
+-                               nrb->_size,
++    nrn_pragma_acc(update self(nrb->_size,
+                                nrb->_pnt_offset,
+-                               nrb->_displ_cnt,
+                                nrb->_pnt_index[:nrb->_size],
+                                nrb->_weight_index[:nrb->_size],
+                                nrb->_displ[:nrb->_size + 1],
+                                nrb->_nrb_index[:nrb->_size])
+                           if (nrb != nullptr))
+-    nrn_pragma_omp(target update from(nrb->_cnt,
+-                                      nrb->_size,
++    nrn_pragma_omp(target update from(nrb->_size,
+                                       nrb->_pnt_offset,
+-                                      nrb->_displ_cnt,
+                                       nrb->_pnt_index[:nrb->_size],
+                                       nrb->_weight_index[:nrb->_size],
+                                       nrb->_displ[:nrb->_size + 1],
+@@ -430,12 +501,7 @@ static void delete_ml_from_device(Memb_list* ml, int type) {
+     {
+         NetReceiveBuffer_t* nrb{ml->_net_receive_buffer};
+         if (nrb) {
+-            cnrn_target_delete(nrb->_nrb_index, nrb->_size);
+-            cnrn_target_delete(nrb->_displ, nrb->_size + 1);
+-            cnrn_target_delete(nrb->_nrb_flag, nrb->_size);
+-            cnrn_target_delete(nrb->_nrb_t, nrb->_size);
+-            cnrn_target_delete(nrb->_weight_index, nrb->_size);
+-            cnrn_target_delete(nrb->_pnt_index, nrb->_size);
++            cnrn_target_delete(static_cast<char*>(nrb->_rows), nrb_nrows * nrb->_row_pitch);
+             cnrn_target_delete(nrb);
+         }
+     }
+@@ -816,60 +882,27 @@ void realloc_net_receive_buffer(NrnThread* nt, Memb_list* ml) {
+ 
+ #ifdef CORENEURON_ENABLE_GPU
+     if (nt->compute_gpu) {
+-        // free existing vectors in buffers on gpu
+-        cnrn_target_delete(nrb->_pnt_index, nrb->_size);
+-        cnrn_target_delete(nrb->_weight_index, nrb->_size);
+-        cnrn_target_delete(nrb->_nrb_t, nrb->_size);
+-        cnrn_target_delete(nrb->_nrb_flag, nrb->_size);
+-        cnrn_target_delete(nrb->_displ, nrb->_size + 1);
+-        cnrn_target_delete(nrb->_nrb_index, nrb->_size);
++        // free the device copy of the rows
++        cnrn_target_delete(static_cast<char*>(nrb->_rows), nrb_nrows * nrb->_row_pitch);
+     }
+ #endif
+-    // Reallocate host buffers using ecalloc_align (as in phase2.cpp) and
+-    // free_memory (as in nrn_setup.cpp)
+-    auto const realloc = [old_size = nrb->_size, nrb](auto*& ptr, std::size_t extra_size = 0) {
+-        using T = std::remove_pointer_t<std::remove_reference_t<decltype(ptr)>>;
+-        static_assert(std::is_trivial<T>::value,
+-                      "Only trivially constructible and copiable types are supported.");
+-        static_assert(std::is_same<decltype(ptr), T*&>::value,
+-                      "ptr should be reference-to-pointer");
+-        auto* const new_data = static_cast<T*>(ecalloc_align((nrb->_size + extra_size), sizeof(T)));
+-        std::memcpy(new_data, ptr, (old_size + extra_size) * sizeof(T));
+-        free_memory(ptr);
+-        ptr = new_data;
+-    };
+-    nrb->_size *= 2;
+-    realloc(nrb->_pnt_index);
+-    realloc(nrb->_weight_index);
+-    realloc(nrb->_nrb_t);
+-    realloc(nrb->_nrb_flag);
+-    realloc(nrb->_displ, 1);
+-    realloc(nrb->_nrb_index);
++    // Double the capacity, keeping the contents of every row.
++    NetReceiveBuffer_t old = *nrb;
++    nrn_net_receive_buffer_alloc(nrb, 2 * old._size);
++    std::memcpy(nrb->_pnt_index, old._pnt_index, old._size * sizeof(int));
++    std::memcpy(nrb->_weight_index, old._weight_index, old._size * sizeof(int));
++    std::memcpy(nrb->_nrb_t, old._nrb_t, old._size * sizeof(double));
++    std::memcpy(nrb->_nrb_flag, old._nrb_flag, old._size * sizeof(double));
++    std::memcpy(nrb->_displ, old._displ, (old._size + 1) * sizeof(int));
++    std::memcpy(nrb->_nrb_index, old._nrb_index, old._size * sizeof(int));
++    nrn_net_receive_buffer_free(&old);
+ #ifdef CORENEURON_ENABLE_GPU
+     if (nt->compute_gpu) {
+         // update device copy
+         nrn_pragma_acc(update device(nrb));
+         nrn_pragma_omp(target update to(nrb));
+-
+         NetReceiveBuffer_t* const d_nrb{cnrn_target_deviceptr(nrb)};
+-        // recopy the vectors in the buffer
+-        int* const d_pnt_index{cnrn_target_copyin(nrb->_pnt_index, nrb->_size)};
+-        cnrn_target_memcpy_to_device(&(d_nrb->_pnt_index), &d_pnt_index);
+-
+-        int* const d_weight_index{cnrn_target_copyin(nrb->_weight_index, nrb->_size)};
+-        cnrn_target_memcpy_to_device(&(d_nrb->_weight_index), &d_weight_index);
+-
+-        double* const d_nrb_t{cnrn_target_copyin(nrb->_nrb_t, nrb->_size)};
+-        cnrn_target_memcpy_to_device(&(d_nrb->_nrb_t), &d_nrb_t);
+-
+-        double* const d_nrb_flag{cnrn_target_copyin(nrb->_nrb_flag, nrb->_size)};
+-        cnrn_target_memcpy_to_device(&(d_nrb->_nrb_flag), &d_nrb_flag);
+-
+-        int* const d_displ{cnrn_target_copyin(nrb->_displ, nrb->_size + 1)};
+-        cnrn_target_memcpy_to_device(&(d_nrb->_displ), &d_displ);
+-
+-        int* const d_nrb_index{cnrn_target_copyin(nrb->_nrb_index, nrb->_size)};
+-        cnrn_target_memcpy_to_device(&(d_nrb->_nrb_index), &d_nrb_index);
++        net_receive_buffer_rows_to_device(nrb, d_nrb);
+     }
+ #endif
+ }
+@@ -942,6 +975,24 @@ void update_net_receive_buffer(NrnThread* nt) {
+ 
+             if (nt->compute_gpu) {
+                 Instrumentor::phase p_net_receive_buffer_order("net-receive-buf-cpu2gpu");
++#if defined(CORENEURON_ENABLE_GPU) && !defined(CORENEURON_PREFER_OPENMP_OFFLOAD) && \
++    defined(_OPENACC)
++                // One copy instead of eight: the used prefix of every row of the block (each
++                // row holds at most _cnt + 1 elements of at most 8 bytes). The NET_RECEIVE
++                // kernel reads only the arrays and gets its loop bound from the host, so the
++                // _cnt/_displ_cnt scalars need not be copied.
++                char* const d_rows = cnrn_target_deviceptr(static_cast<char*>(nrb->_rows));
++                auto const code = cudaMemcpy2DAsync(d_rows,
++                                                    nrb->_row_pitch,
++                                                    nrb->_rows,
++                                                    nrb->_row_pitch,
++                                                    (nrb->_cnt + 1) * sizeof(double),
++                                                    nrb_nrows,
++                                                    cudaMemcpyHostToDevice,
++                                                    static_cast<cudaStream_t>(
++                                                        acc_get_cuda_stream(nt->stream_id)));
++                assert(code == cudaSuccess);
++#else
+                 // note that dont update nrb otherwise we lose pointers
+ 
+                 // clang-format off
+@@ -965,6 +1016,7 @@ void update_net_receive_buffer(NrnThread* nt) {
+                                                 nrb->_displ[:nrb->_displ_cnt + 1],
+                                                 nrb->_nrb_index[:nrb->_cnt]))
+                 // clang-format on
++#endif
+             }
+         }
+     }
+diff --git a/src/coreneuron/io/nrn_setup.cpp b/src/coreneuron/io/nrn_setup.cpp
+index ab5256d04..e58079055 100644
+--- a/src/coreneuron/io/nrn_setup.cpp
++++ b/src/coreneuron/io/nrn_setup.cpp
+@@ -778,12 +778,7 @@ void nrn_cleanup() {
+             NetReceiveBuffer_t* nrb = ml->_net_receive_buffer;
+             if (nrb) {
+                 if (nrb->_size) {
+-                    free_memory(nrb->_pnt_index);
+-                    free_memory(nrb->_weight_index);
+-                    free_memory(nrb->_nrb_t);
+-                    free_memory(nrb->_nrb_flag);
+-                    free_memory(nrb->_displ);
+-                    free_memory(nrb->_nrb_index);
++                    nrn_net_receive_buffer_free(nrb);
+                 }
+                 free_memory(nrb);
+                 ml->_net_receive_buffer = nullptr;
+diff --git a/src/coreneuron/io/phase2.cpp b/src/coreneuron/io/phase2.cpp
+index 3c712f1f5..2e291ff55 100644
+--- a/src/coreneuron/io/phase2.cpp
++++ b/src/coreneuron/io/phase2.cpp
+@@ -522,13 +522,7 @@ void Phase2::set_net_send_buffer(Memb_list** ml_list, const std::vector<int>& pn
+             nrb->_pnt_offset = pnt_offset[type];
+ 
+             // begin with a size equal to the number of instances, or at least 8
+-            nrb->_size = std::max(8, ml->nodecount);
+-            nrb->_pnt_index = (int*) ecalloc_align(nrb->_size, sizeof(int));
+-            nrb->_displ = (int*) ecalloc_align(nrb->_size + 1, sizeof(int));
+-            nrb->_nrb_index = (int*) ecalloc_align(nrb->_size, sizeof(int));
+-            nrb->_weight_index = (int*) ecalloc_align(nrb->_size, sizeof(int));
+-            nrb->_nrb_t = (double*) ecalloc_align(nrb->_size, sizeof(double));
+-            nrb->_nrb_flag = (double*) ecalloc_align(nrb->_size, sizeof(double));
++            nrn_net_receive_buffer_alloc(nrb, std::max(8, ml->nodecount));
+         }
+     }
+ 
+diff --git a/src/coreneuron/mechanism/mechanism.hpp b/src/coreneuron/mechanism/mechanism.hpp
+index 45861fb41..7b9c79a60 100644
+--- a/src/coreneuron/mechanism/mechanism.hpp
++++ b/src/coreneuron/mechanism/mechanism.hpp
+@@ -50,6 +50,12 @@ struct NetReceiveBuffer_t {
+     int _displ_cnt; /* number of unique _pnt_index */
+     int _size;      /* capacity */
+     int _pnt_offset;
++    /* The six arrays above are rows of one block of 6 * _row_pitch bytes (pinned host memory
++     * when running on GPU), mirrored with the same layout on the device, so that a single 2D
++     * copy ships the used prefix of every row. See nrn_net_receive_buffer_alloc(). */
++    void* _rows;
++    size_t _row_pitch;
++    int _rows_pinned;
+     size_t size_of_object() {
+         size_t nbytes = 0;
+         nbytes += _size * sizeof(int) * 3;
+@@ -59,6 +65,12 @@ struct NetReceiveBuffer_t {
+     }
+ };
+ 
++/** Allocate the arrays of \a nrb for \a size entries as rows of one block (see above), and
++ *  point the array members at the rows. Contents are zeroed. */
++void nrn_net_receive_buffer_alloc(NetReceiveBuffer_t* nrb, int size);
++/** Free the block allocated by nrn_net_receive_buffer_alloc() and null the array members. */
++void nrn_net_receive_buffer_free(NetReceiveBuffer_t* nrb);
++
+ struct NetSendBuffer_t: MemoryManaged {
+     int* _sendtype;  // net_send, net_event, net_move
+     int* _vdata_index;

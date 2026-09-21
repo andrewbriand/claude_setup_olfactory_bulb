@@ -29,3 +29,20 @@ Not applied by default. Enable by name:
   **Changes the network realization** (same distribution, different draw order), so it is
   validated statistically, not by checksum — see README "Setup and teardown performance". Turn it off to
   reproduce spike checksums recorded with patch 01 only.
+
+## NEURON patches (`patches/nrn/`)
+
+Applied in order to the `src/nrn` checkout by `02_build_neuron.sh`, which works out which prefix
+of the series is already applied and applies the rest (`NRN_PATCHES_UPTO=NN` stops after patch NN,
+`NO_NRN_PATCHES=1` reverts all). All are bit-identical; see README "Faster spike-event delivery".
+
+* **01-nvtx-ranges-for-coreneuron-phases.patch** — NVTX ranges for CoreNEURON's existing
+  Instrumentor phases.
+* **02-skip-empty-net-receive-passes.patch** — (NMODL codegen) skip a mechanism's NET_RECEIVE pass
+  when nothing was delivered to it.
+* **03-fewer-net-receive-syncs.patch** — (NMODL codegen) drop a redundant stream wait and a no-op
+  send-count reset.
+* **04-single-copy-net-receive-buffer.patch** — (CoreNEURON) receive-buffer arrays as rows of one
+  pinned block; one 2D copy per upload instead of eight.
+* **05-batch-net-receive-passes.patch** — (CoreNEURON + NMODL codegen) launch all mechanisms'
+  NET_RECEIVE kernels, wait once, then process sent events in the original order.

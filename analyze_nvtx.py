@@ -155,6 +155,11 @@ def main(path):
               ts['incl'] / ms, tot['host'] / ms, tot['sync'] / ms, tot['d2h'] / ms, tot['h2d'] / ms,
               tot['launch'] / ms, tot['mpi'] / ms, tot['other'] / ms, tot['gpu'] / ms,
               100 * tot['gpu'] / ts['incl'] if ts['incl'] else 0))
+    cnt = {k: sum(s[k + '#'] for n, s in stat.items() if n != '(outside any range)') / steps
+           for k in ('sync', 'launch', 'd2h', 'h2d', 'other', 'mpi')}
+    print('Per timestep, counts: %.1f syncs, %.1f kernel launches, %.1f device->host copies, '
+          '%.1f host->device copies, %.1f other CUDA calls, %.1f MPI calls' % (
+              cnt['sync'], cnt['launch'], cnt['d2h'], cnt['h2d'], cnt['other'], cnt['mpi']))
 
 
 if __name__ == '__main__':
