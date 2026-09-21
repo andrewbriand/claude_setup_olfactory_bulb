@@ -1,11 +1,12 @@
 --- a/lateral_connections.py
 +++ b/lateral_connections.py
-@@ -3,6 +3,27 @@
+@@ -3,6 +3,48 @@
  import misc
  granules = params.granules
  from gidfunc import *
 +import os
 +from functools import lru_cache
++from itertools import compress
 +
 +# Speed-ups for the mitral->granule candidate search, which dominates model setup.
 +# All of these keep the sequence of points inserted into `pts` below byte-identical,
@@ -16,6 +17,8 @@
 +_NEIGHBOUR_CACHE = int(os.environ.get('OB_NEIGHBOUR_CACHE', '65536'))
 +
 +_OFFSETS = ()   # snapshot of _gran_voxel in its (stable) iteration order; set in init()
++_OFFSET_SET = frozenset()
++_MASKS = {}     # step -> which offsets are new w.r.t. the previous voxel's cube
 +_BND_UP = None  # the two boundary ellipsoids, built once instead of per call
 +_BND_DW = None
 +
@@ -25,15 +28,34 @@
 +    '''Candidate points around one voxel. 89% of lookups repeat, so cache them.'''
 +    qx, qy, qz = q
 +    return [(qx + dx, qy + dy, qz + dz) for dx, dy, dz in _OFFSETS]
++
++
++def _new_mask(step):
++    '''Offsets whose point is NOT already in the previous voxel's cube.
++
++    Walking the path, voxel q's cube overlaps its predecessor's heavily (3.3x
++    redundancy overall). Everything in the overlap was inserted at the previous
++    step, so inserting only the rest gives the same set -- and, because the mask
++    keeps _OFFSETS order, the same first-insertion order, hence the same
++    list(set) order and the same RNG mapping.
++    '''
++    m = _MASKS.get(step)
++    if m is None:
++        sx, sy, sz = step
++        m = tuple((ox + sx, oy + sy, oz + sz) not in _OFFSET_SET
++                  for ox, oy, oz in _OFFSETS)
++        _MASKS[step] = m
++    return m
  
  # set granules type #
  
-@@ -56,40 +77,34 @@
+@@ -56,40 +98,42 @@
              _gran_voxel.add(p)
      old_moves = new_moves
  
-+  global _OFFSETS, _BND_UP, _BND_DW
++  global _OFFSETS, _OFFSET_SET, _BND_UP, _BND_DW
 +  _OFFSETS = tuple(_gran_voxel)
++  _OFFSET_SET = frozenset(_OFFSETS)
 +  _BND_UP = misc.Ellipsoid(params.bulbCenter, params.granAxisUp)
 +  _BND_DW = misc.Ellipsoid(params.bulbCenter, params.granAxisDw)
 +
@@ -75,17 +97,24 @@
    nmoves = 1+int(misc.distance(p_up, p_dw)/params.gran_voxel)
 +  step = 1.0/nmoves
    x = 0.0
++  prev = None
    while x < 1:
 -    pts.update(get_neighbors(get_p(x)))
 -    x += 1.0/nmoves
-+    pts.update(_voxel_neighbours((int((p_dw[0]+x*ux)/d)*d,
-+                                  int((p_dw[1]+x*uy)/d)*d,
-+                                  int((p_dw[2]+x*uz)/d)*d)))
++    q = (int((p_dw[0]+x*ux)/d)*d,
++         int((p_dw[1]+x*uy)/d)*d,
++         int((p_dw[2]+x*uz)/d)*d)
++    if prev is None:
++      pts.update(_voxel_neighbours(q))
++    elif q != prev:
++      pts.update(compress(_voxel_neighbours(q),
++                          _new_mask((q[0]-prev[0], q[1]-prev[1], q[2]-prev[2]))))
++    prev = q
 +    x += step
    return pts
  
  ''' dendrites locations to connect '''
-@@ -143,8 +158,8 @@
+@@ -143,8 +187,8 @@
  
  ''' choice a granule to connect '''
  def connect_to_granule(ci, rng, gconnected):

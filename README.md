@@ -252,31 +252,70 @@ The caveat above was worth heeding: **cProfile disagreed with two of the four le
 
 `patches/01-fast-granule-candidate-search.patch` therefore (a) replaces the append-loop with a list
 comprehension over a hoisted offset tuple, (b) memoizes neighbours **per voxel** in a bounded
-`lru_cache`, and (c) hoists the two boundary ellipsoids (free, since they are immutable). The sequence
-of insertions into the candidate set — and hence the RNG stream and the resulting network — is
-unchanged, so results stay **bit-identical**: `bench.sh verify` passes, and spikes match the
-pre-optimization runs exactly at 1 and 5 glomeruli (51,146 / 250,166 spikes, same checksums).
+`lru_cache`, (c) hoists the two boundary ellipsoids (free, since they are immutable), and (d) inserts
+only each voxel's *new* points: walking the path, a voxel's 125-point cube overlaps its predecessor's
+heavily, and everything in the overlap was inserted one step earlier, so a per-step mask (25 distinct
+masks exist) skips it. That removes the 3.31x redundancy — 169.4M insertions for 51.1M distinct points
+— without touching the *first*-insertion order, which is what fixes `list(set)` order. So results stay
+**bit-identical**: `bench.sh verify` passes, and spikes match the pre-optimization runs exactly at 1 and
+5 glomeruli (51,146 / 250,166 spikes, same checksums).
+
+**Measured budget** (`first:4`, 1 rank, no profiler; `connect_to_granule` = 16.57 s of a 28.44 s build):
+
+| Quantity | Count | Cost |
+|---|---|---|
+| points generated / distinct | 169,444,750 / 51,149,753 | **3.31x redundancy** |
+| set insertion | 169M attempts | ~15 ns each hot, ~80 ns amortized (resize + cache misses) |
+| tuple+int allocation (cache miss) | 18.6M points | **162 ns each** |
+| `rng.discunif` | 154,925 draws (2.97/connection) | 773 ns each = **0.12 s, 0.7%** |
+
+So setup is **allocator- and memory-bound in CPython's object model**, not RNG-bound and not
+instruction-bound: every candidate point is a 3-tuple of heap-allocated ints that must be hashed.
+Contrary to intuition, the per-call RNG overhead is irrelevant at 3 draws per connection.
 
 Quarter bulb (`first:32`), 4 ranks, total setup time and peak RSS per the `OB_NEIGHBOUR_CACHE` knob:
 
-| Cache entries | Setup (s) | Connection phase (s) | Peak RSS | vs baseline |
-|---|---|---|---|---|
-| baseline (unpatched) | 136.2 | 112.5 | 3.44 GB | — |
-| 0 (cache off, (a)+(c) only) | 113.7 | 90.8 | 3.47 GB | 1.20x |
-| 2048 | 97.3 | 73.9 | 3.49 GB | 1.40x |
-| 65536 *(default)* | 75.7 | 50.4 | 4.68 GB | 1.80x |
-| 131072 | **65.2** | 41.0 | 5.89 GB | **2.09x** |
-| 262144 | 66.5 | 41.7 | 6.51 GB | 2.05x |
+| Version | Cache entries | Setup (s) | Connection phase (s) | Peak RSS/rank | vs baseline |
+|---|---|---|---|---|---|
+| unpatched | — | 136.2 | 112.5 | 3.44 GB | — |
+| (a)+(c) only | 0 | 113.7 | 90.8 | 3.47 GB | 1.20x |
+| (a)-(c) | 2048 | 97.3 | 73.9 | 3.49 GB | 1.40x |
+| (a)-(c) | 65536 | 75.7 | 50.4 | 4.68 GB | 1.80x |
+| (a)-(c) | 131072 | 65.2 | 41.0 | 5.89 GB | 2.09x |
+| **+ (d) delta-insert** | 65536 *(default)* | 62.6 | 37.6 | 4.48 GB | 2.18x |
+| **+ (d) delta-insert** | 131072 | **52.3** | 28.3 | 5.62 GB | **2.60x** |
+| + (d), 8 ranks | 8192 | 56.1 | 41.2 | **2.01 GB** | 2.43x |
+
+The last row is the memory tradeoff: the cache costs RAM *per rank* and so competes with running more
+ranks, which is the other 1/n lever. On a RAM-constrained box, more ranks with a small cache gets
+you nearly the same setup time at a third of the per-rank footprint.
 
 The knee is at ~131072 entries — that is the working set; beyond it only memory grows. The default of
 65536 (~19 KB/entry, so ~1.2 GB/rank over baseline) is a compromise for memory-constrained machines;
 **on a big-memory node set `OB_NEIGHBOUR_CACHE=131072`**. 5 glomeruli, 4 ranks: setup 24.2 s -> 15.6 s.
 
-Still unfixed and worth attacking next, in order: the remaining ~41 s connection phase (the per-call
-`set` of ~981 points is now the floor — going faster means changing the algorithm, hence the RNG stream,
-so it needs `-g` sweeps rather than checksums to validate), then `ThreshDetect` construction (~9.4 us
-per point process, a NEURON object-creation floor). Setup still scales ~1/n, so more ranks remain the
-cheapest lever.
+### What is left, and the one big lever that remains
+
+After (a)-(d), `first:4` at 1 rank spends its 23.6 s roughly: ~11.7 s candidate search, ~5.4 s
+`mgrs.__init__` (ThreshDetect + NetCon creation), ~3.0 s `mkgranule`, ~2.1 s parsing `blanes.dic`,
+~2.0 s `mkmitral`. So the candidate search is now ~50% and NEURON object creation ~35%.
+
+The remaining redundancy in the candidate search is small; the real inefficiency is now **structural**:
+the model materializes a ~981-point set per connection in order to draw ~3 samples from it. It never
+needs the set — only uniform samples from it. Sampling `(voxel, offset)` uniformly and accepting only
+first occurrences (an O(path) Chebyshev test) is uniform over the same tube, costs ~10 attempts x
+(773 ns RNG + ~1 us test) ~ 18 us per connection, and would cut the phase roughly **10x**, to ~1-2 s.
+
+That changes the *realization* of the random network — not its distribution. Worth noting before
+rejecting it: this model's network **already** depends on the MPI rank count (46,776 vs 46,900 cells at
+1 vs 4 ranks), so a different realization is exactly as "valid" as changing `-n`. It would have to be
+validated statistically (cell/synapse/spike counts across sizes) instead of by checksum, and it would
+break comparability with spike checksums recorded before it. Hence it is *not* applied here; ask for it
+as an opt-in patch if setup time matters more than continuity with existing runs.
+
+`ThreshDetect`/NetCon construction (~9.4 us per point process) is genuine NEURON object-creation cost
+and only addressable by changing the model's design. Setup still scales ~1/n, so more ranks remain the
+cheapest lever of all.
 
 ### The solve is host-bound, not GPU-bound
 
