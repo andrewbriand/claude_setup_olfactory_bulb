@@ -59,6 +59,7 @@ summarize_runs.py     parse runs/*/run.log -> table + runs/summary.csv
 profile_bulb.sh       one nsys-profiled run -> runs/<ts>_prof_.../rank<N>.nsys-rep
 profile_setup.py      cProfile the model's network construction (CPU-only, no GPU needed)
 patches/              applied to model/ by 03_build_model.sh; upstream src/ stays pristine
+patches/optional/     opt-in, enabled with EXTRA_PATCHES=<name> (changes results; see below)
 dev_rebuild.sh        incremental rebuild after editing NEURON/CoreNEURON sources
 Dockerfile            targets: `bench` (all baked in) and `dev` (toolchain only)
 
@@ -81,6 +82,7 @@ Every value can be overridden from the environment, e.g. `CUDA_ARCH=90 ./02_buil
 | `EXTRA_CMAKE_ARGS` | empty | appended to the NEURON cmake line |
 | `OB_NEIGHBOUR_CACHE` | `65536` | entries in the setup speed-up cache (~19 KB each, per rank); `131072` if RAM allows, `0` disables. Read by the model at run time, not build time |
 | `NO_PATCHES` | `0` | `1` builds the model unpatched (baseline) |
+| `EXTRA_PATCHES` | empty | opt-in patches from `patches/optional/` by name, or `all` |
 
 The NEURON build uses: `nvc`/`nvc++`/NVHPC `nvcc`, `NRN_ENABLE_CORENEURON=ON`,
 `CORENRN_ENABLE_GPU=ON` with **OpenACC** offload (`CORENRN_ENABLE_OPENMP=OFF`), MPI on,
@@ -300,18 +302,48 @@ After (a)-(d), `first:4` at 1 rank spends its 23.6 s roughly: ~11.7 s candidate 
 `mgrs.__init__` (ThreshDetect + NetCon creation), ~3.0 s `mkgranule`, ~2.1 s parsing `blanes.dic`,
 ~2.0 s `mkmitral`. So the candidate search is now ~50% and NEURON object creation ~35%.
 
-The remaining redundancy in the candidate search is small; the real inefficiency is now **structural**:
-the model materializes a ~981-point set per connection in order to draw ~3 samples from it. It never
-needs the set — only uniform samples from it. Sampling `(voxel, offset)` uniformly and accepting only
-first occurrences (an O(path) Chebyshev test) is uniform over the same tube, costs ~10 attempts x
-(773 ns RNG + ~1 us test) ~ 18 us per connection, and would cut the phase roughly **10x**, to ~1-2 s.
+The remaining redundancy in the candidate search is small; the real inefficiency was **structural**:
+the model materialized a ~981-point set per connection in order to draw ~3 samples from it. It never
+needs the set — only uniform samples from it.
 
-That changes the *realization* of the random network — not its distribution. Worth noting before
-rejecting it: this model's network **already** depends on the MPI rank count (46,776 vs 46,900 cells at
-1 vs 4 ranks), so a different realization is exactly as "valid" as changing `-n`. It would have to be
-validated statistically (cell/synapse/spike counts across sizes) instead of by checksum, and it would
-break comparability with spike checksums recorded before it. Hence it is *not* applied here; ask for it
-as an opt-in patch if setup time matters more than continuity with existing runs.
+`patches/optional/02-sample-without-materializing.patch` (**opt-in, changes the network realization**)
+draws `(voxel, offset)` uniformly over the path x cube grid and accepts a pair only at the point's
+*first* occurrence along the path. Each distinct point has exactly one accepted pair, so accepted draws
+are uniform over the same candidate set (acceptance ~30%); rejected points go in a `tried` set, which
+reproduces upstream's sampling without replacement. After 256 consecutive useless draws it falls back
+to the exact set-building loop, which keeps "cannot connect" (`None`) exact near exhaustion. Enable it
+with:
+
+```bash
+EXTRA_PATCHES=02-sample-without-materializing ./03_build_model.sh
+```
+
+Measured (quarter bulb, 4 ranks), against the 136.2 s unpatched baseline:
+
+| Build | Setup | Candidate search | Peak RSS/rank |
+|---|---|---|---|
+| unpatched | 136.2 s | 112.5 s | 3.44 GB |
+| default (patch 01) | 52.3 s | 28.3 s | 5.62 GB |
+| **+ optional 02** | **32.0 s** | **9.8 s** | **3.30 GB** |
+
+That is **4.25x on setup** and **11.5x on the phase** versus unpatched — and it *lowers* memory below
+the unpatched baseline, because nothing is materialized and `OB_NEIGHBOUR_CACHE` goes unused (the
+neighbour cache reports 0 hits / 0 misses). At `first:4` on 1 rank the whole build goes 23.6 s -> 14.0 s.
+Estimated 10x on the phase beforehand; measured 11.5x.
+
+**Validation** (it changes the realization, so checksums cannot be used):
+
+| Config | Cells | NetCons | Spikes |
+|---|---|---|---|
+| 1 glomerulus, 4 ranks | 17,057 = 17,057 | 34,084 = 34,084 | 51,143 vs 51,146 (0.006%) |
+| 5 glomeruli, 4 ranks | 46,797 vs 46,900 (0.22%) | 144,364 = 144,364 | 249,899 vs 250,166 (0.11%) |
+| quarter bulb, 4 ranks | — | 914,676 vs 914,694 (0.002%) | connections 457,338 vs 457,347 |
+
+These deltas are **smaller than the model's own dependence on rank count** (cells move 0.27% between 1
+and 4 ranks), i.e. exactly as "valid" as running `-n 8` instead of `-n 4`, and convergence is unchanged
+(`it=4` both, err 0.0061% vs 0.0042%). It is opt-in anyway, because it breaks spike-checksum
+continuity with runs recorded before it — keep it off when reproducing old results, turn it on when
+setup time matters.
 
 `ThreshDetect`/NetCon construction (~9.4 us per point process) is genuine NEURON object-creation cost
 and only addressable by changing the model's design. Setup still scales ~1/n, so more ranks remain the

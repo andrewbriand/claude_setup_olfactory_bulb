@@ -1,0 +1,181 @@
+--- a/lateral_connections.py
++++ b/lateral_connections.py
+@@ -17,6 +17,8 @@
+ 
+ _OFFSETS = ()   # snapshot of _gran_voxel in its (stable) iteration order; set in init()
+ _OFFSET_SET = frozenset()
++_BOX_R = None   # if the offsets form a full cube, its half-width; else None (set in init())
++_FALLBACK_AFTER = 256   # consecutive useless draws before switching to the exact path
+ _MASKS = {}     # step -> which offsets are new w.r.t. the previous voxel's cube
+ _BND_UP = None  # the two boundary ellipsoids, built once instead of per call
+ _BND_DW = None
+@@ -98,9 +100,15 @@
+             _gran_voxel.add(p)
+     old_moves = new_moves
+ 
+-  global _OFFSETS, _OFFSET_SET, _BND_UP, _BND_DW
++  global _OFFSETS, _OFFSET_SET, _BND_UP, _BND_DW, _BOX_R
+   _OFFSETS = tuple(_gran_voxel)
+   _OFFSET_SET = frozenset(_OFFSETS)
++  # The sampler's "already covered by an earlier voxel" test is 3 range comparisons when
++  # the offsets form a full cube (they do: 5x5x5). Otherwise use a set lookup, which is
++  # correct for any offset shape but slower.
++  _r = max(abs(c) for o in _OFFSETS for c in o)
++  _side = 2 * (_r // d) + 1
++  _BOX_R = _r if len(_OFFSETS) == _side ** 3 else None
+   _BND_UP = misc.Ellipsoid(params.bulbCenter, params.granAxisUp)
+   _BND_DW = misc.Ellipsoid(params.bulbCenter, params.granAxisDw)
+ 
+@@ -108,6 +116,33 @@
+ # ----------------- #
+ 
+ 
++def _tube_path(p):
++    '''Voxels along the segment -> bulb-surface line, in order, without repeats.
++
++    The candidate set is the union of the offset cube centred on each of these.
++    '''
++    p_up = _BND_UP.project(p)
++    p_dw = _BND_DW.project(p)
++    d = params.gran_voxel
++    ux = p_up[0] - p_dw[0]
++    uy = p_up[1] - p_dw[1]
++    uz = p_up[2] - p_dw[2]
++    nmoves = 1 + int(misc.distance(p_up, p_dw) / params.gran_voxel)
++    step = 1.0 / nmoves
++    path = []
++    seen = set()
++    x = 0.0
++    while x < 1:
++        q = (int((p_dw[0]+x*ux)/d)*d,
++             int((p_dw[1]+x*uy)/d)*d,
++             int((p_dw[2]+x*uz)/d)*d)
++        if q not in seen:
++            seen.add(q)
++            path.append(q)
++        x += step
++    return path
++
++
+ ''' get the voxels below the segment would connect to '''
+ def get_granules_below(p, glomid):
+   p_up = _BND_UP.project(p)
+@@ -187,36 +222,95 @@
+ 
+ ''' choice a granule to connect '''
+ def connect_to_granule(ci, rng, gconnected):
++  """Uniform draw from the candidate voxels, without building the candidate set.
++
++  The candidate set is ~981 voxels and only ~3 samples are ever drawn from it, so
++  materializing it (169M point insertions per rank at quarter-bulb scale) is wasted
++  work. Instead draw (voxel, offset) uniformly over the path x cube grid, and accept
++  the pair only if this is the point's *first* occurrence along the path. Every
++  distinct point then has exactly one accepted pair, so accepted draws are uniform
++  over the same candidate set. Acceptance rate is |set| / (len(path)*125), ~30%.
++
++  Rejected points go into `tried`, reproducing upstream's sampling *without*
++  replacement. The sampler cannot know on its own when the set is exhausted, so after
++  _FALLBACK_AFTER consecutive useless draws it hands over to the exact set-building
++  path; that is rare enough to cost nothing and keeps "cannot connect" (None) exact.
++
++  Same distribution as upstream, different realization: the RNG stream is consumed in
++  a different order, exactly as it is when the MPI rank count changes.
++  """
+   up = _BND_UP
+   dw = _BND_DW
+-  
+-  gvoxels = list(get_granules_below(ci[-1], mgid2glom(ci[0])))
++  cgid = ci[0]
++
++  if ismitral(cgid):
++    ok_lo, ok_hi = 0, 1
++  elif ismtufted(cgid):
++    ok_lo, ok_hi = 1, 2
++  else:
++    return None   # upstream's is_proper_type() rejects every voxel in this case
++
++  path = _tube_path(ci[-1])
++  nofs = len(_OFFSETS)
++  hi = len(path) * nofs - 1
++  R = _BOX_R
++  tried = set()
++  useless = 0
+ 
+-  def inside_boundary(p):
+-    return up.normalRadius(p) < 1 and dw.normalRadius(p) >= 1
+-  
+-  def is_proper_type(cgid, gpos):
+-    gtype = pos2type[gpos]
+-    if ismitral(cgid):
+-      return gtype == 0 or gtype == 1
+-    elif ismtufted(cgid):
+-      return gtype == 1 or gtype == 2
+-    return False
+-      
+   while True:
+-    # cannot connect
+-    if len(gvoxels) == 0:
+-      break
+-    
+-    index = int(rng.discunif(0, len(gvoxels)-1))
+-    gpos = gvoxels[index]
++    i, j = divmod(int(rng.discunif(0, hi)), nofs)
++    qx, qy, qz = path[i]
++    ox, oy, oz = _OFFSETS[j]
++    gx = qx + ox
++    gy = qy + oy
++    gz = qz + oz
++
++    # accept only at the first voxel along the path whose cube covers this point
++    first = True
++    if R is None:
++      for k in range(i):
++        px, py, pz = path[k]
++        if (gx-px, gy-py, gz-pz) in _OFFSET_SET:
++          first = False
++          break
++    else:
++      for k in range(i):
++        px, py, pz = path[k]
++        if -R <= gx-px <= R and -R <= gy-py <= R and -R <= gz-pz <= R:
++          first = False
++          break
++
++    gpos = (gx, gy, gz)
++    if not first or gpos in tried:
++      useless += 1
++      if useless > _FALLBACK_AFTER:
++        return _connect_exhaustive(ci, rng, gconnected, tried, ok_lo, ok_hi)
++      continue
++    useless = 0
++
++    if up.normalRadius(gpos) < 1 and dw.normalRadius(gpos) >= 1 and gpos not in gconnected:
++      gtype = pos2type[gpos]
++      if gtype == ok_lo or gtype == ok_hi:
++        return granules.pos2ggid[gpos], 0, rng.uniform(0, 1), gpos
++
++    tried.add(gpos)
+ 
+-    # the voxel is a granule
+-    if inside_boundary(gpos) and gpos not in gconnected and is_proper_type(ci[0], gpos):
+-      return granules.pos2ggid[gpos], 0, rng.uniform(0, 1), gpos
+ 
++def _connect_exhaustive(ci, rng, gconnected, tried, ok_lo, ok_hi):
++  """Upstream's loop over the candidates not yet tried; used only near exhaustion."""
++  up = _BND_UP
++  dw = _BND_DW
++  gvoxels = [p for p in get_granules_below(ci[-1], mgid2glom(ci[0])) if p not in tried]
++
++  while gvoxels:
++    index = int(rng.discunif(0, len(gvoxels)-1))
++    gpos = gvoxels[index]
++    if up.normalRadius(gpos) < 1 and dw.normalRadius(gpos) >= 1 and gpos not in gconnected:
++      gtype = pos2type[gpos]
++      if gtype == ok_lo or gtype == ok_hi:
++        return granules.pos2ggid[gpos], 0, rng.uniform(0, 1), gpos
+     del gvoxels[index]
+-    
++
+   return None
+ 
+ 

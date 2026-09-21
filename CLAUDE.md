@@ -34,9 +34,12 @@ or else document explicitly why the network legitimately changed.
 6. **Report**: `runs/summary.csv`, the GPU/CPU model, and any deviations from this procedure.
    Add new pitfalls to the "Gotchas" section of README.md.
 7. **Setup time** is ~2/3 of wall clock for big runs and is model-side Python. On a big-memory node
-   set `OB_NEIGHBOUR_CACHE=131072` (see README "Setup time"). If you optimise further, **profile
-   before believing any lead** — `profile_setup.py` needs no GPU, and cProfile already refuted two
-   plausible-looking leads that were read from the code.
+   set `OB_NEIGHBOUR_CACHE=131072` (see README "Setup time"). For 4x faster setup at the cost of a
+   different (statistically equivalent) network realization, build with
+   `EXTRA_PATCHES=02-sample-without-materializing`; it also needs *less* memory. If you optimise
+   further, **profile before believing any lead** — `profile_setup.py` needs no GPU, and cProfile
+   already refuted two plausible-looking leads that were read from the code.
+8. **Next target is output/teardown**, ~40% of full-bulb wall clock on the H100 and never profiled.
 
 ## Known pitfalls (details in README "Gotchas")
 

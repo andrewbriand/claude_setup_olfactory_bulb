@@ -2,6 +2,8 @@
 # Copy the model's sim/ directory to model/, apply patches/*.patch to the copy, and
 # compile its mechanisms for NEURON + CoreNEURON (GPU). Produces model/x86_64/special.
 # The upstream checkout in src/ is never modified. Skip patches with NO_PATCHES=1.
+# Opt-in patches from patches/optional/ are applied only when named in EXTRA_PATCHES,
+# e.g. EXTRA_PATCHES=02-sample-without-materializing ./03_build_model.sh (or =all).
 set -euo pipefail
 TOP="$(cd "$(dirname "$0")" && pwd)"
 source "$TOP/env.sh"
@@ -15,6 +17,16 @@ if [ "${NO_PATCHES:-0}" != "1" ]; then
   for p in "$TOP"/patches/*.patch; do
     [ -e "$p" ] || break
     echo "applying $(basename "$p")"
+    patch -p1 -d "$MODEL_DIR" < "$p"
+  done
+  if [ "${EXTRA_PATCHES:-}" = "all" ]; then
+    set -- "$TOP"/patches/optional/*.patch
+  else
+    set -- ${EXTRA_PATCHES:+$(for n in $EXTRA_PATCHES; do echo "$TOP/patches/optional/$n.patch"; done)}
+  fi
+  for p in "$@"; do
+    [ -e "$p" ] || { echo "no such optional patch: $p" >&2; exit 1; }
+    echo "applying optional $(basename "$p")"
     patch -p1 -d "$MODEL_DIR" < "$p"
   done
 fi
