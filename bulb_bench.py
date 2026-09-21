@@ -31,6 +31,33 @@ def _safe_printperf(p):
         print('printperf: skipped (NEURON step time is 0 under CoreNEURON)')
 parrun.printperf = _safe_printperf
 
+# Fast exit. After util.finish() prints "total elapsed time" every output is written and
+# closed, and the process exits through Python finalization, which frees the model object
+# by object. NEURON's NetCvode::presyn_disconnect() does a linear find + erase in a vector
+# of every PreSyn on the rank, so that teardown is O(P^2): ~22 s for a quarter bulb at 4
+# ranks, ~12 min for the full bulb at 4 ranks on the H100. Pinning an extra reference on
+# every model-module global keeps finalization from freeing the graph -- the OS reclaims
+# it at exit instead -- while NEURON's normal exit path, MPI_Finalize included, still runs.
+# OB_FAST_EXIT=0 restores the upstream behaviour.
+import ctypes
+import os
+import sys
+import util
+
+_MODEL_DIR = os.path.dirname(os.path.realpath(__file__))
+_finish = util.finish
+
+def _finish_without_teardown():
+    for m in list(sys.modules.values()):
+        f = getattr(m, '__file__', None)
+        if f and os.path.dirname(os.path.realpath(f)) == _MODEL_DIR:
+            for v in list(vars(m).values()):
+                ctypes.pythonapi.Py_IncRef(ctypes.py_object(v))
+    _finish()
+
+if os.environ.get('OB_FAST_EXIT', '1') != '0':
+    util.finish = _finish_without_teardown
+
 params.sniff_invl_min = params.sniff_invl_max = 500
 params.training_exc = params.training_inh = True
 

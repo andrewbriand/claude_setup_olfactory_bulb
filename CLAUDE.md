@@ -40,7 +40,10 @@ or else document explicitly why the network legitimately changed.
    `EXTRA_PATCHES=02-sample-without-materializing`; it also needs *less* memory. If you optimise
    further, **profile before believing any lead** — `profile_setup.py` needs no GPU, and cProfile
    already refuted two plausible-looking leads that were read from the code.
-8. **Next target is output/teardown**, ~40% of full-bulb wall clock on the H100 and never profiled.
+8. **Teardown is fixed by default** (`OB_FAST_EXIT=1`; root cause is an O(P^2) loop in NEURON's
+   `presyn_disconnect`, see README "Teardown"). The next post-setup target is `h.stdinit()`
+   (~7 s at quarter bulb / 4 ranks), then weight-file writing. On the H100, measure wall clock
+   with and without `OB_FAST_EXIT` at full bulb — the expected saving is most of the ~12 min.
 
 ## Known pitfalls (details in README "Gotchas")
 

@@ -80,7 +80,8 @@ Every value can be overridden from the environment, e.g. `CUDA_ARCH=90 ./02_buil
 | `MPI_LAUNCH` | `mpirun --oversubscribe -x ... -np` | launcher prefix; e.g. `srun --mpi=pmix -n` on Slurm |
 | `PREFIX`, `VENV`, `BUILD_DIR`, `SRC_DIR` | under this directory | |
 | `EXTRA_CMAKE_ARGS` | empty | appended to the NEURON cmake line |
-| `OB_NEIGHBOUR_CACHE` | `65536` | entries in the setup speed-up cache (~19 KB each, per rank); `131072` if RAM allows, `0` disables. Read by the model at run time, not build time |
+| `OB_NEIGHBOUR_CACHE` | `65536` | entries in the setup speed-up cache (~19 KB each, per rank); `131072` if RAM allows, `0` disables. Read by the model at run time, not build time; exported by `config.sh` |
+| `OB_FAST_EXIT` | `1` | skip the O(P^2) object-graph teardown at exit (see "Teardown"); `0` = upstream behaviour |
 | `NO_PATCHES` | `0` | `1` builds the model unpatched (baseline) |
 | `EXTRA_PATCHES` | empty | opt-in patches from `patches/optional/` by name, or `all` |
 
@@ -411,6 +412,50 @@ cache-hit rate may be lower at full scale (larger per-rank working set) while th
 depend on it; "other" is the measured remainder; and runs carry ~5% noise. Worth measuring on the H100
 with `EXTRA_PATCHES=02-sample-without-materializing`.
 
+### Teardown: an O(P^2) loop inside NEURON, now skipped (default)
+
+The H100 run spent **748 s of a 1368 s wall clock** (4 ranks) after the simulation had finished, with
+every rank at 100% CPU, and it got *superlinearly* worse with fewer ranks (253 s at 8 ranks, 2 ranks
+killed after 14+ min) — the signature of an O(n^2) algorithm. Sampling a rank's stack with `gdb` during
+teardown (quarter bulb, 4 ranks; 7 of 9 samples):
+
+```
+Py_FinalizeEx -> hoc_free_object -> PreSyn::~PreSyn -> NetCvode::presyn_disconnect
+                                                        -> std::find(vector<PreSyn*>) / vector::erase
+```
+
+`presyn_disconnect()` (`src/nrncvode/netcvode.cpp`) does a linear `std::find` plus `erase` on `psl_`, a
+vector of *every* `PreSyn` on the rank, and then a second linear search over the per-thread threshold
+lists. Each deletion is O(P); interpreter shutdown deletes all P of them one at a time, so teardown is
+O(P^2) per rank. It is a NEURON performance bug, not something the model does wrong.
+
+Every output file is written and closed before `util.finish()` prints `total elapsed time`, so freeing
+the graph at exit is pure waste. `bulb_bench.py` pins an extra reference on every model-module global
+before finishing, so shutdown never drops them to zero and the OS reclaims the memory instead. NEURON's
+normal exit path, `MPI_Finalize` included, still runs. Upstream code is untouched; `OB_FAST_EXIT=0`
+restores the old behaviour.
+
+A/B on the quarter bulb, 4 ranks, `-t 1`, timestamped, no debugger attached:
+
+| | Wall | Setup | Handoff + solve | Output | **Teardown** | `mpirun` rc |
+|---|---|---|---|---|---|---|
+| `OB_FAST_EXIT=0` (upstream) | 91.4 s | 58.4 s | 11.5 s | 2.6 s | **18.9 s** | 0 |
+| `OB_FAST_EXIT=1` (default) | 73.9 s | 58.6 s | 11.2 s | 2.6 s | **1.5 s** | 0 |
+
+All output files are byte-identical between the two, and with fast exit on, `bench.sh verify` passes and
+spikes match the unpatched reference runs exactly at 1 and 5 glomeruli. Because the cost is O(P^2), the
+saving grows with per-rank model size: at full bulb / 4 ranks it should remove essentially all of the
+H100's ~12 min.
+
+The proper fix belongs in NEURON (O(1) removal, e.g. an index stored in each `PreSyn` with swap-and-pop,
+checking that nothing depends on `psl_` order); that would also help sessions that delete and rebuild
+networks without exiting, which a fast exit cannot.
+
+**What is left after setup** (quarter bulb, 4 ranks, all `tstop`-independent, ~13.9 s in total):
+`h.stdinit()` 6.95 s (NEURON-side initialization, including the model's custom `init()` HOC loop over
+every segment), CoreNEURON handoff + `nrn_setup` + GPU upload ~2.9 s, weight-file writing 2.15 s (a
+Python string format per synapse), spike sort/write 0.42 s. `stdinit` is the next target.
+
 ### The solve is host-bound, not GPU-bound
 
 Trace: full bulb, 4 ranks, `tstop=20` (426 timesteps), all 4 ranks profiled. `nsys` overhead was only
@@ -510,16 +555,14 @@ See the container gotchas below — a dev-image run needs the host MPI bind-moun
   handoff then holds two copies of the model. WSL2 gets half the host RAM by default (host here: 62 GB). To run
   `-g all` here, raise it in `C:\Users\<you>\.wslconfig` (`[wsl2]` / `memory=54GB`) and run
   `wsl --shutdown`. Otherwise use `first:N` sizes. GPU memory is not the limit (quarter bulb: 1.5 GB).
-* **Post-run teardown is CPU-bound and can take longer than the whole simulation.** After the model
-  prints `total elapsed time`, every rank sits at 100% CPU for minutes destroying the
-  NEURON/Python object graph. At full bulb this was ~12 min at 4 ranks and still running after 14 min
-  at 2 ranks (vs a 123 s solve), and it scales with cells-and-synapses *per rank*, so it is worst at low
-  rank counts. It is invisible in `solver_s` but is the single largest line in wall clock (748 s of a
-  1368 s run at 4 ranks). It is also tstop-independent — a 20 ms run pays the same teardown as a 1050 ms
-  one. If you only need `Solver Time`, it is already in `run.log` before teardown starts and the run can
-  be killed. **Kill by verified PID**, not `pkill -f special`: `run_bulb.sh` starts the next run within
-  seconds, and a stale pattern match will take out the run you just launched (this cost one profiling run
-  here).
+* **Post-run teardown used to take longer than the whole simulation — fixed by default.** After
+  `total elapsed time`, interpreter shutdown freed the model object by object, and NEURON's
+  `NetCvode::presyn_disconnect()` makes each `PreSyn` deletion O(P), so teardown was O(P^2) per rank
+  (~12 min at full bulb / 4 ranks on the H100; 2 ranks never finished). `bulb_bench.py` now skips it
+  (`OB_FAST_EXIT=1`, the default); see "Teardown" below. With `OB_FAST_EXIT=0`, `Solver Time` is still
+  in `run.log` before teardown starts and the run can be killed — **by verified PID**, not
+  `pkill -f special`: `run_bulb.sh` starts the next run within seconds, and a stale pattern match will
+  take out the run you just launched (this cost one profiling run here).
 * **Don't scale `Solver Time` linearly with `-t`.** There is ~1.5 s of fixed cost inside `psolve` (GPU
   warmup, first-touch, initial event-queue setup). At full bulb, `-t 20` measured 3.67 s where the
   1050 ms rate predicts 2.20 s — 8.6 ms/timestep vs 5.16 ms/timestep. Comparing a short profiled run
