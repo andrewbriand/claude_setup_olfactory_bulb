@@ -13,7 +13,7 @@
 +# so the RNG stream in connect_to_granule (and hence the network) is unchanged.
 +# Entries in the per-voxel neighbour cache; ~19 KB each (125 tuples + overhead).
 +# Setup time keeps improving up to ~131072 (the working set), then flattens; lower it
-+# on memory-constrained machines, 0 disables caching. See README "Setup time".
++# on memory-constrained machines, 0 disables caching. See README "Setup and teardown performance".
 +_NEIGHBOUR_CACHE = int(os.environ.get('OB_NEIGHBOUR_CACHE', '65536'))
 +
 +_OFFSETS = ()   # snapshot of _gran_voxel in its (stable) iteration order; set in init()

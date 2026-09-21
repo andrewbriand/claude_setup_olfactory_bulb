@@ -6,6 +6,10 @@ CoreNEURON GPU support (OpenACC via NVIDIA HPC SDK) and run the
 Developed and validated on an RTX 4090 (WSL2); intended to be re-run on an FP64-capable GPU
 for benchmarking.
 
+Network construction and post-run teardown used to dwarf the simulation itself. By default they are now
+~2.3x and ~12x faster respectively, with bit-identical results; see
+[Setup and teardown performance](#setup-and-teardown-performance).
+
 ```bash
 ./setup_all.sh               # fetch -> venv -> build NEURON -> build model -> verify  (~15 min)
 ./run_bulb.sh -m gpu -n 4 -t 50 -g 5                # a single run
@@ -58,6 +62,7 @@ compare_spikes.sh     check spike outputs of runs are identical
 summarize_runs.py     parse runs/*/run.log -> table + runs/summary.csv
 profile_bulb.sh       one nsys-profiled run -> runs/<ts>_prof_.../rank<N>.nsys-rep
 profile_setup.py      cProfile the model's network construction (CPU-only, no GPU needed)
+repro_presyn_disconnect.py  standalone NEURON reproducer for the O(N^2) teardown
 patches/              applied to model/ by 03_build_model.sh; upstream src/ stays pristine
 patches/optional/     opt-in, enabled with EXTRA_PATCHES=<name> (changes results; see below)
 dev_rebuild.sh        incremental rebuild after editing NEURON/CoreNEURON sources
@@ -81,7 +86,7 @@ Every value can be overridden from the environment, e.g. `CUDA_ARCH=90 ./02_buil
 | `PREFIX`, `VENV`, `BUILD_DIR`, `SRC_DIR` | under this directory | |
 | `EXTRA_CMAKE_ARGS` | empty | appended to the NEURON cmake line |
 | `OB_NEIGHBOUR_CACHE` | `65536` | entries in the setup speed-up cache (~19 KB each, per rank); `131072` if RAM allows, `0` disables. Read by the model at run time, not build time; exported by `config.sh` |
-| `OB_FAST_EXIT` | `1` | skip the O(P^2) object-graph teardown at exit (see "Teardown"); `0` = upstream behaviour |
+| `OB_FAST_EXIT` | `1` | skip the O(P^2) object-graph teardown at exit (see "Setup and teardown performance"); `0` = upstream behaviour |
 | `NO_PATCHES` | `0` | `1` builds the model unpatched (baseline) |
 | `EXTRA_PATCHES` | empty | opt-in patches from `patches/optional/` by name, or `all` |
 
@@ -135,7 +140,7 @@ CoreNEURON-CPU and CoreNEURON-GPU and requires identical spikes. Verified on the
 
 1 glomerulus: 1 rank: CoreNEURON-CPU 16.9 s vs CoreNEURON-GPU 5.3 s (3.2×).
 4 ranks: NEURON 9.1 s, CoreNEURON-CPU 5.2 s, CoreNEURON-GPU 10.0 s.
-Quarter bulb (`first:32`), GPU, 4 ranks: 37.9 s solver (setup 133 s).
+Quarter bulb (`first:32`), GPU, 4 ranks: 37.9 s solver (setup 133 s, unpatched).
 Ranges are repeat runs; expect ~5% run-to-run variance, so repeat benchmark points.
 
 The 4090 has 1/64-rate FP64 and GPU utilization during the solve was only ~28%. At these sizes the
@@ -157,7 +162,9 @@ CoreNEURON-GPU, matching the spike count from the 4090 reference above.
 | 4 | **115.5** | 504 | 1368 | 748 | 10.5 GB | 8.4% |
 | 2 | 123.3 | 939 | — | — | — | (killed in teardown) |
 
-The full bulb runs comfortably in 196 GB; GPU memory is never the constraint (~10 GB at 4 ranks).
+These are **unpatched** numbers (before the setup and teardown fixes; see "Setup and teardown
+performance"). The full bulb runs comfortably in 196 GB; GPU memory is never the constraint (~10 GB at
+4 ranks).
 
 **Read this table twice.** Solver time is flat within noise from 4 to 8 ranks (3.3% spread, vs ~5%
 run-to-run variance), with a real minimum at 4 and a clear degradation at 2 (+6.8%). But *wall clock*
@@ -186,276 +193,6 @@ So setup responds to rank count all the way down, with no diminishing-returns wa
 large amount of per-rank Python work. Predicted 1 rank: ~33 min, which is why the 1-rank full-bulb
 point is not worth collecting.
 
-### Where the setup time actually goes (it is the model, not NEURON)
-
-`run.log` carries per-phase `elapsedtime` lines. At 8 ranks, of 263 s of setup:
-
-```
- 214.06 s  Mitral 1790443 and mTufted 0 cells connection infos. generated (it=6,err=...)   <- 81%
-  33.70 s  3580886 ThreshDetect for reciprocalsynapses constructed
-   5.42 s  1905 mitrals created and connections to mitrals determined
-   (everything else < 5 s)
-```
-
-One phase is ~81% of setup: the rejection-sampling retry loop in `mk_mconnection_info`
-(`determine_connections.py`), which assigns mitral lateral dendrites to granule cells and retries
-rejected ones, converging in 6 MPI-synchronised iterations. It costs **~120 us per connection**, which
-is very slow for an RNG draw plus a geometric lookup. Reading `connect_to_granule`
-(`lateral_connections.py`), the per-call work includes:
-
-* **four `misc.Ellipsoid` constructions per call** (two directly, two more inside
-  `get_granules_below`), all from module-level constants — ~7M identical objects built and thrown away;
-* **`del gvoxels[index]` inside the rejection loop**, which is O(n) in a Python list, making the inner
-  loop O(n^2) in the candidate count;
-* **`get_granules_below` rebuilding the whole candidate voxel set on every retry**, though it is a pure
-  function of `(dendrite point, glomid)` and therefore cacheable;
-* four closures redefined per call.
-
-All of this is in **olfactory-bulb-3d**, not NEURON. Note which fixes preserve results: hoisting the
-constant objects, caching `get_granules_below` and lifting the closures do not touch the RNG stream, so
-spikes stay bit-identical and `compare_spikes.sh` validates them exactly. Changing the O(n) delete to
-swap-and-pop, or batching the `rng.discunif()` draws, **reorders the random stream and generates a
-different (equally valid) network** — those need separate validation. `rng` is NEURON's
-`h.Random().Random123()` (`params.py:146`), so each rejection-loop iteration is a Python->HOC call;
-the fix is still model-side (draw less often / in bulk), not a NEURON change.
-The 33.7 s of `ThreshDetect` construction is ~9.4 us per point process — genuine NEURON object-creation
-cost, near its floor, and only addressable by changing the model's design.
-
-**Caveat: the four bullets above come from reading the code, not from a profiler.** Only the 214 s phase
-total and the ~120 us/connection unit cost are measured. Before optimising, confirm the split with
-`cProfile` on a small model — it is pure Python and needs no GPU, e.g.
-`./run_bulb.sh -m gpu -n 1 -t 1 -g first:8` with `python -m cProfile` around the construction, or simply
-time the phases at two sizes. Best guess is that the candidate-set rebuild and the O(n) delete dominate
-and the `Ellipsoid` churn is secondary, but that is a guess.
-
-Per this repo's agent instructions the upstream repos are not patched here; any fix belongs on a **fork
-of olfactory-bulb-3d** (last upstream commit 2022-11-07, so a fork carries almost no rebase burden —
-unlike NEURON, which is pinned to an actively-developed master and is not where the win is anyway).
-
-### Setup time: profiled and fixed (4090, 2026-09-20) — 2.1x faster
-
-The caveat above was worth heeding: **cProfile disagreed with two of the four leads.** Measured with
-`profile_setup.py` (`first:4`, 1 rank, 85.7 s under the profiler):
-
-| Function | Calls | tottime | cumtime |
-|---|---|---|---|
-| `get_neighbors` (inside `get_granules_below`) | 1,355,558 | 36.6 s | 53.0 s |
-| `list.append` (its inner loop) | 170,326,048 | 16.5 s | — |
-| `set.update` | 1,355,566 | 8.2 s | — |
-| `get_granules_below` | 52,156 | 4.6 s | **67.6 s (79% of build)** |
-| `Ellipsoid.__init__` | 439,043 | 0.49 s | 1.17 s (**1.4%**) |
-
-* **The `Ellipsoid` churn is 1.4%, not a hotspot**, and the O(n) `del gvoxels[index]` never surfaces —
-  the list is short (~980) and `del` is C code, so the rejection loop is not where the time goes.
-* **Caching `get_granules_below` per the agent's suggestion would gain ~3%:** instrumenting the keys
-  shows only **3.6%** of its 52,156 calls repeat a voxel *path*.
-* The cost is simply generating candidate points: **1.36M voxel lookups x 125 offsets = 170M tuples**,
-  deduplicated down to ~981 points per call. But one level down, **89.3% of the voxel lookups repeat**
-  (144,764 distinct voxels out of 1,355,558) — the reuse is per *voxel*, not per path.
-
-`patches/01-fast-granule-candidate-search.patch` therefore (a) replaces the append-loop with a list
-comprehension over a hoisted offset tuple, (b) memoizes neighbours **per voxel** in a bounded
-`lru_cache`, (c) hoists the two boundary ellipsoids (free, since they are immutable), and (d) inserts
-only each voxel's *new* points: walking the path, a voxel's 125-point cube overlaps its predecessor's
-heavily, and everything in the overlap was inserted one step earlier, so a per-step mask (25 distinct
-masks exist) skips it. That removes the 3.31x redundancy — 169.4M insertions for 51.1M distinct points
-— without touching the *first*-insertion order, which is what fixes `list(set)` order. So results stay
-**bit-identical**: `bench.sh verify` passes, and spikes match the pre-optimization runs exactly at 1 and
-5 glomeruli (51,146 / 250,166 spikes, same checksums).
-
-**Measured budget** (`first:4`, 1 rank, no profiler; `connect_to_granule` = 16.57 s of a 28.44 s build):
-
-| Quantity | Count | Cost |
-|---|---|---|
-| points generated / distinct | 169,444,750 / 51,149,753 | **3.31x redundancy** |
-| set insertion | 169M attempts | ~15 ns each hot, ~80 ns amortized (resize + cache misses) |
-| tuple+int allocation (cache miss) | 18.6M points | **162 ns each** |
-| `rng.discunif` | 154,925 draws (2.97/connection) | 773 ns each = **0.12 s, 0.7%** |
-
-So setup is **allocator- and memory-bound in CPython's object model**, not RNG-bound and not
-instruction-bound: every candidate point is a 3-tuple of heap-allocated ints that must be hashed.
-Contrary to intuition, the per-call RNG overhead is irrelevant at 3 draws per connection.
-
-Quarter bulb (`first:32`), 4 ranks, total setup time and peak RSS per the `OB_NEIGHBOUR_CACHE` knob:
-
-| Version | Cache entries | Setup (s) | Connection phase (s) | Peak RSS/rank | vs baseline |
-|---|---|---|---|---|---|
-| unpatched | — | 136.2 | 112.5 | 3.44 GB | — |
-| (a)+(c) only | 0 | 113.7 | 90.8 | 3.47 GB | 1.20x |
-| (a)-(c) | 2048 | 97.3 | 73.9 | 3.49 GB | 1.40x |
-| (a)-(c) | 65536 | 75.7 | 50.4 | 4.68 GB | 1.80x |
-| (a)-(c) | 131072 | 65.2 | 41.0 | 5.89 GB | 2.09x |
-| **+ (d) delta-insert** | 65536 *(default)* | 62.6 | 37.6 | 4.48 GB | 2.18x |
-| **+ (d) delta-insert** | 131072 | **52.3** | 28.3 | 5.62 GB | **2.60x** |
-| + (d), 8 ranks | 8192 | 56.1 | 41.2 | **2.01 GB** | 2.43x |
-
-The last row is the memory tradeoff: the cache costs RAM *per rank* and so competes with running more
-ranks, which is the other 1/n lever. On a RAM-constrained box, more ranks with a small cache gets
-you nearly the same setup time at a third of the per-rank footprint.
-
-The knee is at ~131072 entries — that is the working set; beyond it only memory grows. The default of
-65536 (~19 KB/entry, so ~1.2 GB/rank over baseline) is a compromise for memory-constrained machines;
-**on a big-memory node set `OB_NEIGHBOUR_CACHE=131072`**. 5 glomeruli, 4 ranks: setup 24.2 s -> 15.6 s.
-
-### What is left, and the one big lever that remains
-
-After (a)-(d), `first:4` at 1 rank spends its 23.6 s roughly: ~11.7 s candidate search, ~5.4 s
-`mgrs.__init__` (ThreshDetect + NetCon creation), ~3.0 s `mkgranule`, ~2.1 s parsing `blanes.dic`,
-~2.0 s `mkmitral`. So the candidate search is now ~50% and NEURON object creation ~35%.
-
-The remaining redundancy in the candidate search is small; the real inefficiency was **structural**:
-the model materialized a ~981-point set per connection in order to draw ~3 samples from it. It never
-needs the set — only uniform samples from it.
-
-`patches/optional/02-sample-without-materializing.patch` (**opt-in, changes the network realization**)
-draws `(voxel, offset)` uniformly over the path x cube grid and accepts a pair only at the point's
-*first* occurrence along the path. Each distinct point has exactly one accepted pair, so accepted draws
-are uniform over the same candidate set (acceptance ~30%); rejected points go in a `tried` set, which
-reproduces upstream's sampling without replacement. After 256 consecutive useless draws it falls back
-to the exact set-building loop, which keeps "cannot connect" (`None`) exact near exhaustion. Enable it
-with:
-
-```bash
-EXTRA_PATCHES=02-sample-without-materializing ./03_build_model.sh
-```
-
-Measured (quarter bulb, 4 ranks), against the 136.2 s unpatched baseline:
-
-| Build | Setup | Candidate search | Peak RSS/rank |
-|---|---|---|---|
-| unpatched | 136.2 s | 112.5 s | 3.44 GB |
-| default (patch 01) | 52.3 s | 28.3 s | 5.62 GB |
-| **+ optional 02** | **32.0 s** | **9.8 s** | **3.30 GB** |
-
-That is **4.25x on setup** and **11.5x on the phase** versus unpatched — and it *lowers* memory below
-the unpatched baseline, because nothing is materialized and `OB_NEIGHBOUR_CACHE` goes unused (the
-neighbour cache reports 0 hits / 0 misses). At `first:4` on 1 rank the whole build goes 23.6 s -> 14.0 s.
-Estimated 10x on the phase beforehand; measured 11.5x.
-
-**Validation** (it changes the realization, so checksums cannot be used):
-
-| Config | Cells | NetCons | Spikes |
-|---|---|---|---|
-| 1 glomerulus, 4 ranks | 17,057 = 17,057 | 34,084 = 34,084 | 51,143 vs 51,146 (0.006%) |
-| 5 glomeruli, 4 ranks | 46,797 vs 46,900 (0.22%) | 144,364 = 144,364 | 249,899 vs 250,166 (0.11%) |
-| quarter bulb, 4 ranks | — | 914,676 vs 914,694 (0.002%) | connections 457,338 vs 457,347 |
-
-These deltas are **smaller than the model's own dependence on rank count** (cells move 0.27% between 1
-and 4 ranks), i.e. exactly as "valid" as running `-n 8` instead of `-n 4`, and convergence is unchanged
-(`it=4` both, err 0.0061% vs 0.0042%). It is opt-in anyway, because it breaks spike-checksum
-continuity with runs recorded before it — keep it off when reproducing old results, turn it on when
-setup time matters.
-
-### NEURON object creation (patch 03, default, bit-identical)
-
-Profiling the synapse constructor (`MGRS.__init__`, ~66 us/call under cProfile) against the cost of
-the NEURON primitives it creates found two pure-Python overheads:
-
-* **`gc_is_superficial(ggid)` was 32% of the constructor**: 96,247 calls at 17.7 us, each building two
-  `Ellipsoid` objects, for a result that depends only on `ggid` (~2 calls per granule). Memoized, and
-  using the ellipsoids built once in `init()`.
-* **Every `h.<Name>` is a HOC symbol lookup costing 1.55 us** (vs 0.05 us for a bound local), and the
-  constructor did ~7 per synapse. Bound once, lazily (the `GranuleSpine` template only exists after
-  the .hoc files load).
-
-Quarter bulb, 4 ranks: synapse construction **12.9 s -> 9.4 s (1.38x)**, granule building 2.08 ->
-1.88 s, total setup 52.3 -> 47.9 s (29.3 s with the optional sampler). Spikes bit-identical.
-
-**Is there a vectorized / batch creation API that would do better?** NEURON has no bulk constructor
-for point processes or NetCons in its Python API; the closest thing is doing the loop in HOC. Measured
-(20,000 objects each, counts verified):
-
-| Object | Python, lookups hoisted | pure HOC loop | 
-|---|---|---|
-| `ThreshDetect` | 1.18 us | 0.44 us |
-| `NetCon` | 1.18 us | 0.67 us |
-| `GranuleSpine` (2 sections) | 14.04 us | **9.94 us** |
-
-A HOC batch path would save ~8 us of the ~40 us per synapse — ~20% of that phase, ~6% of setup. The
-floor is genuine C++ work, dominated by creating the spine's two sections (~10 us even with no Python
-at all). Not worth the rewrite; no object-creation change gets anywhere near 2x.
-
-### Where 2x+ still exists: ranks, and a serial floor
-
-Quarter bulb with patches 01 + 03 + optional 02, measured:
-
-| Phase | 4 ranks | 8 ranks | Scales? |
-|---|---|---|---|
-| import-time bulb geometry (every rank builds all granule positions) | 3.3 s | 3.6 s | **no** |
-| mitrals | 2.6 s | 1.3 s | yes |
-| candidate search | 10.0 s | 6.0 s | yes |
-| granules | 1.9 s | 1.0 s | yes |
-| blanes -> granule | 1.9 s | 1.0 s | yes |
-| synapse construction | 9.2 s | 5.1 s | yes |
-| **total setup** | **29.3 s** | **18.3 s** | 1.6x |
-
-Setup still scales ~1/n, so rank count is the remaining 2x lever and needs no code; the ~3.5 s of
-import-time geometry is the serial floor it runs into. With the sampler, memory is ~1.9 GB/rank at
-quarter scale, so more ranks are affordable.
-
-### Estimated full-bulb setup on the H100
-
-Per-phase speedups measured here (quarter bulb, 4 ranks: candidate search 3.98x with 01, 11.33x with
-01 + 02; synapse construction 1.38x with 03) applied to the H100's measured full-bulb phase split
-(8 ranks: search 214 s, synapses 34 s, total 263 s; 4 ranks: total 504 s):
-
-| Configuration | Search | Synapses | Other | **Setup, 4 ranks** | vs baseline | Setup, 8 ranks |
-|---|---|---|---|---|---|---|
-| baseline (unpatched) | 428 s | 67 s | 8 s | **504 s** (measured) | 1.00x | 263 s (measured) |
-| 01 | 108 s | 67 s | 8 s | 184 s | 2.75x | 103 s |
-| 01 + 03 (**default**) | 107 s | 49 s | 8 s | **165 s** | 3.06x | 93 s |
-| 01 + optional 02 | 38 s | 67 s | 8 s | 114 s | 4.43x | 68 s |
-| 01 + 03 + optional 02 | 38 s | 49 s | 8 s | **95 s** | **5.28x** | 59 s |
-
-These are estimates, not H100 measurements: the factors come from a quarter bulb on Zen 5; patch 01's
-cache-hit rate may be lower at full scale (larger per-rank working set) while the sampler does not
-depend on it; "other" is the measured remainder; and runs carry ~5% noise. Worth measuring on the H100
-with `EXTRA_PATCHES=02-sample-without-materializing`.
-
-### Teardown: an O(P^2) loop inside NEURON, now skipped (default)
-
-The H100 run spent **748 s of a 1368 s wall clock** (4 ranks) after the simulation had finished, with
-every rank at 100% CPU, and it got *superlinearly* worse with fewer ranks (253 s at 8 ranks, 2 ranks
-killed after 14+ min) — the signature of an O(n^2) algorithm. Sampling a rank's stack with `gdb` during
-teardown (quarter bulb, 4 ranks; 7 of 9 samples):
-
-```
-Py_FinalizeEx -> hoc_free_object -> PreSyn::~PreSyn -> NetCvode::presyn_disconnect
-                                                        -> std::find(vector<PreSyn*>) / vector::erase
-```
-
-`presyn_disconnect()` (`src/nrncvode/netcvode.cpp`) does a linear `std::find` plus `erase` on `psl_`, a
-vector of *every* `PreSyn` on the rank, and then a second linear search over the per-thread threshold
-lists. Each deletion is O(P); interpreter shutdown deletes all P of them one at a time, so teardown is
-O(P^2) per rank. It is a NEURON performance bug, not something the model does wrong.
-
-Every output file is written and closed before `util.finish()` prints `total elapsed time`, so freeing
-the graph at exit is pure waste. `bulb_bench.py` pins an extra reference on every model-module global
-before finishing, so shutdown never drops them to zero and the OS reclaims the memory instead. NEURON's
-normal exit path, `MPI_Finalize` included, still runs. Upstream code is untouched; `OB_FAST_EXIT=0`
-restores the old behaviour.
-
-A/B on the quarter bulb, 4 ranks, `-t 1`, timestamped, no debugger attached:
-
-| | Wall | Setup | Handoff + solve | Output | **Teardown** | `mpirun` rc |
-|---|---|---|---|---|---|---|
-| `OB_FAST_EXIT=0` (upstream) | 91.4 s | 58.4 s | 11.5 s | 2.6 s | **18.9 s** | 0 |
-| `OB_FAST_EXIT=1` (default) | 73.9 s | 58.6 s | 11.2 s | 2.6 s | **1.5 s** | 0 |
-
-All output files are byte-identical between the two, and with fast exit on, `bench.sh verify` passes and
-spikes match the unpatched reference runs exactly at 1 and 5 glomeruli. Because the cost is O(P^2), the
-saving grows with per-rank model size: at full bulb / 4 ranks it should remove essentially all of the
-H100's ~12 min.
-
-The proper fix belongs in NEURON (O(1) removal, e.g. an index stored in each `PreSyn` with swap-and-pop,
-checking that nothing depends on `psl_` order); that would also help sessions that delete and rebuild
-networks without exiting, which a fast exit cannot.
-
-**What is left after setup** (quarter bulb, 4 ranks, all `tstop`-independent, ~13.9 s in total):
-`h.stdinit()` 6.95 s (NEURON-side initialization, including the model's custom `init()` HOC loop over
-every segment), CoreNEURON handoff + `nrn_setup` + GPU upload ~2.9 s, weight-file writing 2.15 s (a
-Python string format per synapse), spike sort/write 0.42 s. `stdinit` is the next target.
-
 ### The solve is host-bound, not GPU-bound
 
 Trace: full bulb, 4 ranks, `tstop=20` (426 timesteps), all 4 ranks profiled. `nsys` overhead was only
@@ -479,9 +216,276 @@ This explains the whole rank sweep: 2 ranks cannot cover the host-side gaps, 4 c
 overlap, and 8 adds more per-rank synchronisation than it recovers. Under MPS the *device* is busier
 than 18% (up to ~70% if overlap were perfect); the per-rank figure is the actionable one.
 
-Consequence for optimisation priorities: across the whole workload the GPU is idle most of the time —
-setup is ~40% of wall, output and teardown ~55%, and the solve itself is 8–19% and only ~18% GPU-busy
-within that. Speeding up the model's Python construction is worth far more than any solver tuning.
+Consequence for optimisation priorities, as measured *before* the fixes below: across the whole
+workload the GPU was idle most of the time — setup ~40% of wall, output and teardown ~55%, the solve
+8–19% and only ~18% GPU-busy within that. Setup and teardown are now largely fixed (see "Setup and
+teardown performance"), which leaves the solve's host-boundedness as the main remaining target.
+
+## Setup and teardown performance
+
+On the unpatched model, the H100's full-bulb run at 4 ranks spent **504 s building the network** and
+**~748 s after the simulation had finished**, around a **115 s solve**. Both overheads are fixed here
+without modifying either upstream checkout: model changes are patches applied to the `model/` copy,
+and the teardown fix lives in our driver, `bulb_bench.py`.
+
+### At a glance
+
+| Fix | Where | Default? | Effect (quarter bulb, 4 ranks, this box) | Results |
+|---|---|---|---|---|
+| Fast candidate search | `patches/01-fast-granule-candidate-search.patch` | **on** | candidate search 112.5 s -> 37.3 s (28.3 s with a bigger cache) | bit-identical |
+| Cheaper NEURON object creation | `patches/03-cheaper-object-creation.patch` | **on** | synapse construction 12.9 s -> 9.4 s | bit-identical |
+| Sample candidates without building the set | `patches/optional/02-sample-without-materializing.patch` | opt-in | candidate search -> 9.8 s, *less* memory | same distribution, different network realization |
+| Fast exit (skip teardown) | `bulb_bench.py` | **on** | teardown 18.9 s -> 1.5 s | outputs byte-identical |
+
+**Setup, measured** (quarter bulb `first:32`, 4 ranks):
+
+| Build | `OB_NEIGHBOUR_CACHE` | Setup | vs unpatched | Peak RSS/rank |
+|---|---|---|---|---|
+| unpatched (`NO_PATCHES=1`) | — | 136.2 s | 1.00x | 3.44 GB |
+| **default: 01 + 03** | 65536 (default) | **58.5 s** | **2.3x** | 4.46 GB |
+| default: 01 + 03 | 131072 | 47.9 s | 2.8x | 5.62 GB |
+| 01 + 03 + optional 02 | (unused) | **29.3 s** | **4.6x** | **3.29 GB** |
+
+**Teardown, measured** (same model, `-t 1`): 18.9 s -> 1.5 s; wall clock 91.4 s -> 73.9 s.
+
+**Full bulb on the H100, estimated.** Per-phase speedups measured here (candidate search 3.98x with 01
+and 11.33x with 01 + 02, synapse construction 1.38x with 03) applied to the H100's measured phase split
+(8 ranks: candidate search 214 s, synapses 34 s, total 263 s; 4 ranks: total 504 s):
+
+| Configuration | Candidate search | Synapses | Other | **Setup, 4 ranks** | vs baseline | Setup, 8 ranks |
+|---|---|---|---|---|---|---|
+| baseline (unpatched) | 428 s | 67 s | 8 s | **504 s** (measured) | 1.00x | 263 s (measured) |
+| 01 | 108 s | 67 s | 8 s | 184 s | 2.75x | 103 s |
+| 01 + 03 (**default**) | 107 s | 49 s | 8 s | **165 s** | 3.06x | 93 s |
+| 01 + optional 02 | 38 s | 67 s | 8 s | 114 s | 4.43x | 68 s |
+| 01 + 03 + optional 02 | 38 s | 49 s | 8 s | **95 s** | **5.28x** | 59 s |
+
+With fast exit also removing ~12 min of teardown, **full-bulb wall clock at 4 ranks should drop from
+1368 s to roughly 330–380 s** with the defaults (setup ~165 s + solve 115.5 s + 50–100 s of remaining
+post-setup work), or ~260–310 s with the optional sampler. These are estimates: the factors come from a
+quarter bulb on Zen 5, patch 01's cache may hit less often at full scale (the sampler does not depend on
+it), the teardown figure is the H100 run's approximate "~12 min", and runs carry ~5% noise. **Confirm
+with one full-bulb run on the H100** before quoting them.
+
+### Using it
+
+* **Nothing to do for the defaults.** `03_build_model.sh` applies `patches/*.patch`; `bulb_bench.py`
+  skips teardown.
+* **`OB_NEIGHBOUR_CACHE`** (default 65536, exported by `config.sh`): entries in patch 01's per-voxel
+  cache, ~19 KB each *per rank*. Setup improves up to ~131072 (the working set) and then flattens. Use
+  131072 on big-memory nodes; lower it, or use more ranks, when RAM is tight. Ignored by optional 02.
+* **`EXTRA_PATCHES=02-sample-without-materializing ./03_build_model.sh`** for the fastest setup and the
+  lowest memory. It changes the network *realization* (not its distribution), so keep it off when you
+  need spike checksums comparable with earlier runs.
+* **`NO_PATCHES=1 ./03_build_model.sh`** rebuilds the unpatched baseline. **`OB_FAST_EXIT=0`** restores
+  upstream's exit path.
+* **More ranks** shorten setup and teardown about 1/n each (see "Rank scaling" below); 4 ranks remains
+  the best point for benchmarking the *solver* on the H100.
+* After changing patches, run `./bench.sh verify`, and compare against an unpatched run at the same `-n`
+  with `compare_spikes.sh`.
+
+### Why setup was slow
+
+`run.log` has per-phase `elapsedtime` lines. On the H100 at 8 ranks, **214 s of 263 s (81%)** went to
+one phase, `Mitral ... cells connection infos. generated`: `connect_to_granule()` in
+`lateral_connections.py`, which for each mitral dendrite segment builds the set of candidate granule
+voxels under it (a 5x5x5 cube of offsets around each voxel on the line to the bulb surface) and draws
+uniformly from it with rejection. Setup scales 1/n with a 98.9% parallel fraction
+(`setup(n) = 1932/n + 21 s` fits three measured points), so it is per-rank Python work, not
+communication.
+
+The H100 report listed four suspects from reading the code (per-call `Ellipsoid` construction, an O(n)
+`del` in the rejection loop, rebuilding the candidate set, closures), with the caveat that they were
+unprofiled. **`cProfile` (`profile_setup.py`) refuted two of them:**
+
+| Suspect | Verdict |
+|---|---|
+| `Ellipsoid` constructions per call | real but **1.4%** of the build |
+| O(n) `del gvoxels[index]` | never surfaces: the list is ~980 long and `del` is C code |
+| cache the candidate set per call | only **3.6%** of calls repeat a voxel path — worth ~3% |
+| **what the profiler actually showed** | `get_neighbors`: 1.36M calls, 170M tuples generated, **79% of the build** |
+
+A counted, unprofiled run (`first:4`, 1 rank; `connect_to_granule` = 16.6 s of a 28.4 s build):
+
+| Quantity | Count | Unit cost |
+|---|---|---|
+| candidate points generated / distinct | 169,444,750 / 51,149,753 | **3.31x redundancy** |
+| set insertions | 169M | ~15 ns hot, ~80 ns amortized |
+| tuple + int allocations (cache misses) | 18.6M | **162 ns** each |
+| voxel lookups that repeat an earlier voxel | 89.3% of 1,355,558 | — |
+| `rng.discunif` draws | 154,925 (2.97 per connection) | 773 ns = **0.12 s total, 0.7%** |
+
+So setup was **allocator- and hash-bound in CPython's object model**: every candidate is a 3-tuple of
+heap-allocated ints, generated 3.3 times over. It was *not* RNG-bound — the Python-to-HOC RNG call is
+expensive per call, but there are only ~3 per connection — and not instruction-bound.
+
+### Patch 01: fast candidate search (default, bit-identical)
+
+Four changes to `lateral_connections.py`:
+
+1. a list comprehension over a hoisted offset tuple instead of 170M `list.append` calls;
+2. a bounded `lru_cache` of each voxel's 125 neighbours, since 89% of voxel lookups repeat;
+3. the two boundary ellipsoids built once (they are immutable) instead of per call;
+4. **delta insertion**: walking the line, each voxel's cube mostly overlaps its predecessor's, and the
+   overlap was inserted one step earlier, so a per-step mask (only 25 distinct masks exist) inserts just
+   the new points. This removes the 3.31x redundancy.
+
+Why the results stay **bit-identical**: the model draws `index = discunif(0, len-1)` into `list(set)`,
+whose order is fixed by the set's *first*-insertion order. None of the changes alters that order, so the
+RNG maps to the same voxels and builds the same network. Verified: spikes match unpatched runs exactly
+(51,146 at 1 glomerulus, 250,166 at 5, same checksums).
+
+Measured, quarter bulb, 4 ranks (steps 1–3 first, then with step 4):
+
+| Version | Cache entries | Setup | Candidate search | Peak RSS/rank |
+|---|---|---|---|---|
+| unpatched | — | 136.2 s | 112.5 s | 3.44 GB |
+| steps 1 + 3 | 0 | 113.7 s | 90.8 s | 3.47 GB |
+| steps 1–3 | 65536 | 75.7 s | 50.4 s | 4.68 GB |
+| steps 1–3 | 131072 | 65.2 s | 41.0 s | 5.89 GB |
+| steps 1–3 | 262144 | 66.5 s | 41.7 s | 6.51 GB |
+| **steps 1–4** | 65536 | 62.6 s | 37.6 s | 4.48 GB |
+| **steps 1–4** | 131072 | **52.3 s** | 28.3 s | 5.62 GB |
+
+### Patch 03: cheaper NEURON object creation (default, bit-identical)
+
+The synapse constructor (`MGRS.__init__`, ~66 µs per call under the profiler) creates two
+`ThreshDetect`s, a `FastInhib`, an `AmpaNmda`, a two-section `GranuleSpine`, several `NetCon`s and gid
+registrations — a floor of ~40 µs of NEURON primitives. On top of that it paid two pure-Python costs:
+
+* **`gc_is_superficial(ggid)` was 32% of the constructor**: 96,247 calls at 17.7 µs, each building two
+  `Ellipsoid`s, for a pure function of the granule id. Now memoized per granule.
+* **Every `h.<Name>` is a HOC symbol lookup costing 1.55 µs** (vs 0.05 µs for a local), ~7 per synapse.
+  The templates are now bound once, lazily, since `GranuleSpine` only exists after the `.hoc` files load.
+
+Quarter bulb, 4 ranks: synapse construction **12.9 s -> 9.4 s (1.38x)**, granule building 2.08 ->
+1.88 s. Spikes bit-identical to unpatched runs.
+
+**Would a vectorized / batch creation path do better?** NEURON has no bulk constructor for point
+processes or NetCons in its Python API; the closest is building objects in a HOC loop. Measured, 20,000
+objects each:
+
+| Object | Python (lookups hoisted) | Pure HOC loop |
+|---|---|---|
+| `ThreshDetect` | 1.18 µs | 0.44 µs |
+| `NetCon` | 1.18 µs | 0.67 µs |
+| `GranuleSpine` (2 sections) | 14.04 µs | **9.94 µs** |
+
+A HOC batch path would save ~8 µs of ~40 µs per synapse — ~20% of that phase, ~6% of setup — because the
+floor is genuine C++ work, above all creating each spine's two sections. Not worth the rewrite.
+
+### Optional patch 02: sample candidates without building the set
+
+Even after patch 01, each connection materializes a ~981-point set to draw ~3 samples from it. Patch 02
+instead draws `(voxel, offset)` uniformly over the line × cube grid and accepts a pair only at the
+point's *first* occurrence along the line (a range test against earlier voxels). Each distinct point has
+exactly one accepted pair, so accepted draws are uniform over the same candidate set (~30% acceptance).
+Rejected points go into a `tried` set, reproducing the original sampling without replacement, and after
+256 consecutive useless draws it hands over to the exact set-building loop so that "cannot connect"
+stays exact near exhaustion.
+
+Quarter bulb, 4 ranks: candidate search **112.5 s -> 9.8 s (11.5x)**, setup 32.0 s on top of 01 alone
+and 29.3 s on top of 01 + 03, at **3.29 GB/rank — below the unpatched baseline**, since nothing is
+materialized and the cache goes unused.
+
+It consumes the RNG stream in a different order, so the network is a different realization of the same
+random ensemble. Checksums can't validate that, so it was compared statistically at 4 ranks:
+
+| Config | Cells | NetCons | Spikes |
+|---|---|---|---|
+| 1 glomerulus | 17,057 = 17,057 | 34,084 = 34,084 | 51,143 vs 51,146 (0.006%) |
+| 5 glomeruli | 46,797 vs 46,900 (0.22%) | 144,364 = 144,364 | 249,899 vs 250,166 (0.11%) |
+| quarter bulb | — | 914,676 vs 914,694 (0.002%) | connections 457,338 vs 457,347 |
+
+Every delta is smaller than the model's own dependence on rank count (cells move 0.27% between 1 and 4
+ranks), and convergence is unchanged (`it=4`, err 0.0061% vs 0.0042%). The patch is generated against
+01 + 03 and applies on top of them.
+
+### Rank scaling and the serial floor
+
+Quarter bulb, 01 + 03 + optional 02:
+
+| Phase | 4 ranks | 8 ranks | Scales? |
+|---|---|---|---|
+| import-time bulb geometry (every rank builds all granule positions) | 3.3 s | 3.6 s | **no** |
+| mitrals | 2.6 s | 1.3 s | yes |
+| candidate search | 10.0 s | 6.0 s | yes |
+| granules | 1.9 s | 1.0 s | yes |
+| blanes -> granule | 1.9 s | 1.0 s | yes |
+| synapse construction | 9.2 s | 5.1 s | yes |
+| **total setup** | **29.3 s** | **18.3 s** | 1.6x |
+
+Rank count is the remaining 2x lever for setup and needs no code; the ~3.5 s of import-time geometry is
+the serial floor it approaches. With optional 02, memory is ~1.9 GB/rank at quarter scale.
+
+### Teardown: an O(P²) loop inside NEURON, skipped at exit (default)
+
+The H100 run spent **748 s of a 1368 s wall clock** (4 ranks) after the simulation, with every rank at
+100% CPU, and it got *superlinearly* worse with fewer ranks: 253 s at 8 ranks, still running after
+14 min at 2. Sampling a rank's stack with `gdb` during teardown (quarter bulb, 4 ranks), 7 of 9 samples:
+
+```
+Py_FinalizeEx -> hoc_free_object -> PreSyn::~PreSyn -> NetCvode::presyn_disconnect
+                                                        -> std::find(vector<PreSyn*>) / vector::erase
+```
+
+`NetCvode::presyn_disconnect()` (`src/nrncvode/netcvode.cpp`) does a linear `std::find` + `erase` on a
+vector of *every* `PreSyn` on the rank, and for threshold sources a second linear search over the
+per-thread threshold lists. Each deletion is O(P), and shutdown deletes all P, so teardown is **O(P²)
+per rank** — a NEURON performance bug that any large network hits. `repro_presyn_disconnect.py` shows it
+with stock NEURON and built-in mechanisms: doubling N multiplies deletion time by 3.6–4.0, and the cost
+per `PreSyn` grows linearly (1.0 µs at 10k `IntFire1`s, 8.6 µs at 160k; 13.9 µs at 80k voltage-threshold
+sources).
+
+**The fix.** Every output is written and closed before `util.finish()` prints `total elapsed time`, so
+freeing the object graph just before exit is pure waste. `bulb_bench.py` pins an extra reference on
+every model-module global before finishing; interpreter shutdown then never frees the graph, and the OS
+reclaims the memory at exit. NEURON's normal exit path, `MPI_Finalize` included, still runs.
+
+A/B, quarter bulb, 4 ranks, `-t 1`, each output line timestamped, no debugger attached:
+
+| | Wall | Setup | Handoff + solve | Output | **Teardown** | `mpirun` rc |
+|---|---|---|---|---|---|---|
+| `OB_FAST_EXIT=0` (upstream) | 91.4 s | 58.4 s | 11.5 s | 2.6 s | **18.9 s** | 0 |
+| `OB_FAST_EXIT=1` (default) | 73.9 s | 58.6 s | 11.2 s | 2.6 s | **1.5 s** | 0 |
+
+All output files are byte-identical between the two; with fast exit on, `bench.sh verify` passes and
+spikes match the unpatched references at 1 and 5 glomeruli. Because the cost is quadratic in per-rank
+model size, the saving is far larger at full scale — essentially the H100's whole ~12 minutes.
+
+The proper fix belongs in NEURON: amortized O(1) removal (e.g. tombstone the slot and compact
+occasionally, which keeps `psl_` order unchanged) and lazily rebuilt threshold lists. That would also
+help sessions that delete and rebuild networks without exiting, which a fast exit cannot.
+
+### What is left after setup
+
+Quarter bulb, 4 ranks, all independent of `tstop` (~13.9 s in total):
+
+| Step | Time |
+|---|---|
+| `h.stdinit()`: NEURON-side initialization, incl. the model's custom `init()` HOC loop over every segment | **6.95 s** |
+| handoff to CoreNEURON begins | 1.09 s |
+| CoreNEURON `nrn_setup` (build + GPU upload) | 1.77 s |
+| CoreNEURON mechanism setup + finitialize | 0.88 s |
+| weight files (a Python string format per synapse) | **2.15 s** |
+| spike sort/write | 0.42 s |
+
+`stdinit` is the largest remaining non-solver cost after setup.
+
+### Reproducing these measurements
+
+* **Setup profile** (CPU only, no GPU needed):
+  `source env.sh && cd model && mpirun -np 1 -x PYTHONPATH ./x86_64/special -mpi -python profile_setup.py --gloms first:4`
+  prints the top functions and writes `setup.prof.<rank>` for `pstats`.
+* **Per-phase setup times**: the `elapsedtime` lines in any `runs/*/run.log`.
+* **Before/after comparisons**: build the baseline with `NO_PATCHES=1 ./03_build_model.sh`, run, rebuild
+  with the patches, run again at the same `-n`/`-g`/`-t`, then `./compare_spikes.sh <before> <after>`.
+* **Teardown**: run with `PYTHONUNBUFFERED=1` (forwarded with `-x`) and timestamp each output line, e.g.
+  `... | perl -MTime::HiRes=time -ne 'BEGIN{$|=1} printf "%.3f %s", time, $_'`; teardown is the gap from
+  the `total elapsed time` line to process exit. Compare `OB_FAST_EXIT=0` and `1`.
+* **Where a live rank is spending time** (no `perf` on WSL): `gdb -p <pid> -batch -ex "bt 25"`, repeated
+  every couple of seconds.
+* **The NEURON O(P²) on its own**: `python repro_presyn_disconnect.py [threshold]` after `source env.sh`.
 
 ## Profiling
 
@@ -559,7 +563,7 @@ See the container gotchas below — a dev-image run needs the host MPI bind-moun
   `total elapsed time`, interpreter shutdown freed the model object by object, and NEURON's
   `NetCvode::presyn_disconnect()` makes each `PreSyn` deletion O(P), so teardown was O(P^2) per rank
   (~12 min at full bulb / 4 ranks on the H100; 2 ranks never finished). `bulb_bench.py` now skips it
-  (`OB_FAST_EXIT=1`, the default); see "Teardown" below. With `OB_FAST_EXIT=0`, `Solver Time` is still
+  (`OB_FAST_EXIT=1`, the default); see "Setup and teardown performance". With `OB_FAST_EXIT=0`, `Solver Time` is still
   in `run.log` before teardown starts and the run can be killed — **by verified PID**, not
   `pkill -f special`: `run_bulb.sh` starts the next run within seconds, and a stale pattern match will
   take out the run you just launched (this cost one profiling run here).

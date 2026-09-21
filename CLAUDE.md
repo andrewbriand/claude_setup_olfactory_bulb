@@ -34,14 +34,14 @@ or else document explicitly why the network legitimately changed.
 6. **Report**: `runs/summary.csv`, the GPU/CPU model, and any deviations from this procedure.
    Add new pitfalls to the "Gotchas" section of README.md.
 7. **Setup time** is ~2/3 of wall clock for big runs and is model-side Python. On a big-memory node
-   set `OB_NEIGHBOUR_CACHE=131072` (see README "Setup time"). Default patches 01 + 03 give ~3x on
+   set `OB_NEIGHBOUR_CACHE=131072` (see README "Setup and teardown performance"). Default patches 01 + 03 give ~3x on
    setup, bit-identical. For ~5x at the cost of a
    different (statistically equivalent) network realization, build with
    `EXTRA_PATCHES=02-sample-without-materializing`; it also needs *less* memory. If you optimise
    further, **profile before believing any lead** — `profile_setup.py` needs no GPU, and cProfile
    already refuted two plausible-looking leads that were read from the code.
 8. **Teardown is fixed by default** (`OB_FAST_EXIT=1`; root cause is an O(P^2) loop in NEURON's
-   `presyn_disconnect`, see README "Teardown"). The next post-setup target is `h.stdinit()`
+   `presyn_disconnect`, see README "Setup and teardown performance"). The next post-setup target is `h.stdinit()`
    (~7 s at quarter bulb / 4 ranks), then weight-file writing. On the H100, measure wall clock
    with and without `OB_FAST_EXIT` at full bulb — the expected saving is most of the ~12 min.
 

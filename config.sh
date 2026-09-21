@@ -34,9 +34,9 @@ BUILD_JOBS="${BUILD_JOBS:-$(nproc)}"
 CMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE:-Release}"
 
 # ---- Model runtime knobs (read by the model on every rank; forwarded by MPI_LAUNCH) --
-# Candidate-search cache entries, ~19 KB each per rank (see README "Setup time").
+# Candidate-search cache entries, ~19 KB each per rank (see README "Setup and teardown performance").
 export OB_NEIGHBOUR_CACHE="${OB_NEIGHBOUR_CACHE:-65536}"
-# 1 = skip the O(P^2) object-graph teardown at exit (see README "Teardown"); 0 = upstream.
+# 1 = skip the O(P^2) object-graph teardown at exit (see README "Setup and teardown performance"); 0 = upstream.
 export OB_FAST_EXIT="${OB_FAST_EXIT:-1}"
 
 # ---- Launch ------------------------------------------------------------------
