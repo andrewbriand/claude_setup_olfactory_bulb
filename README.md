@@ -34,13 +34,15 @@ the model's own `bulb3dtest.py`). Every item keeps spikes bit-identical unless n
 **Load the network from the connection cache** — the big one, opt-in:
 
 ```bash
-OB_CONN_CACHE=1 ./run_bulb.sh -m gpu -n 8 -t 1 -g all      # once: builds the network, writes conncache/
-OB_CONN_CACHE=1 ./run_bulb.sh -m gpu -n 1 -t 1050 -g all   # every later run, at any -n, loads it
+OB_CONN_CACHE=1 ./run_bulb.sh -m gpu -n 16 -t 1 -g all     # once: builds the network, writes conncache/
+OB_CONN_CACHE=1 ./run_bulb.sh -m gpu -n 4 -t 1050 -g all   # every later run, at any -n >= 2, loads it
 ```
 
 This skips the candidate search (80% of unpatched setup). Quarter bulb on the 4090: 1 rank
-155.5 s -> 54 s, 4 ranks 58.5 s -> 20.2 s; estimated ~5 min instead of ~11.5 min for the full bulb on
-one H100 rank. The rank count of the first (generating) run defines the network, and every rank count
+155.5 s -> 54 s, 4 ranks 58.5 s -> 20.2 s. **Measured on the H100, full bulb:** generating at 16 ranks
+takes 95 s of setup, and loading at 4 ranks 69–72 s (vs 504 s unpatched; see "H100, 2026-09-23"). The
+full bulb cannot run on 1 rank at all (a CoreNEURON limit, see Gotchas), so use `-n 2` or more for
+`-g all`. The rank count of the first (generating) run defines the network, and every rank count
 then simulates that same network with identical spikes. Generate at a high rank count, where it is
 fast; on a RAM-limited box add `OB_NEIGHBOUR_CACHE=8192` to that run (it does not change the network).
 Delete the cache directory to regenerate. Details: "Connection cache".
@@ -62,8 +64,9 @@ teardown performance".
 **NEURON patch `patches/nrn/02-fewer-net-receive-round-trips.patch`** — on by default, applied by
 `02_build_neuron.sh` (fewer stream syncs, one upload per receive buffer, batched NET_RECEIVE passes;
 spike-event delivery went from 66.7 to 29.5 ms per timestep). Quarter bulb, 1 rank, 4090: solver
-46.4 s -> 25.0 s. Expect a smaller gain on native Linux (H100), where GPU round trips are cheaper than
-under WSL2. To compare against the baseline on a new machine, same `-n/-t/-g` both times:
+46.4 s -> 25.0 s. On native Linux the gain is much smaller, because GPU round trips are cheaper than
+under WSL2: **H100, full bulb, 4 ranks, 1050 ms: 112.4 s -> 106.3 s (5.5%)**, two runs each, within ~1%
+of each other. To compare against the baseline on a new machine, same `-n/-t/-g` both times:
 
 ```bash
 NRN_PATCHES_UPTO=01 ./02_build_neuron.sh && ./03_build_model.sh   # baseline: NVTX ranges only
@@ -111,6 +114,7 @@ sudo NVHPC_SILENT=true NVHPC_INSTALL_DIR=/opt/nvidia/hpc_sdk NVHPC_INSTALL_TYPE=
 ## Layout
 
 ```
+NOTES.md              project log: open items, decisions, per-session state
 config.sh             ALL machine-specific settings (paths, versions, GPU arch, MPI launcher)
 env.sh                source to get compilers/MPI/NEURON/venv on PATH (used by run scripts)
 requirements.txt      Python deps (build + runtime), versions capped as in NEURON's repo
@@ -132,7 +136,7 @@ profile_setup.py      cProfile the model's network construction (CPU-only, no GP
 repro_presyn_disconnect.py  standalone NEURON reproducer for the O(N^2) teardown
 patches/              applied to model/ by 03_build_model.sh; upstream src/ stays pristine
 patches/optional/     opt-in, enabled with EXTRA_PATCHES=<name> (changes results; see below)
-patches/nrn/          NEURON patches (NVTX; faster spike-event delivery), applied in order to the
+patches/nrn/          NEURON patches (NVTX; faster spike-event delivery; no per-event NVTX range), applied in order to the
                       src/nrn checkout by 02_build_neuron.sh
 dev_rebuild.sh        incremental rebuild after editing NEURON/CoreNEURON sources
 Dockerfile            targets: `bench` (all baked in) and `dev` (toolchain only)
@@ -293,6 +297,30 @@ Consequence for optimisation priorities, as measured *before* the fixes below: a
 workload the GPU was idle most of the time — setup ~40% of wall, output and teardown ~55%, the solve
 8–19% and only ~18% GPU-busy within that. Setup and teardown are now largely fixed (see "Setup and
 teardown performance"), which leaves the solve's host-boundedness as the main remaining target.
+
+## Results on the H100, 2026-09-23 (current defaults)
+
+Same machine type as above (H100 80GB HBM3, Xeon Platinum 8468, 16 cores, 196 GB, driver 580.173.02),
+built and run **inside the dev container** (NVHPC 25.7, its bundled HPC-X MPI), MPS daemon running
+(compute mode was `Default` this time, so MPS was optional). Model patches 01 + 03, NEURON patches
+01 + 02 (+ 03 where noted), `OB_FAST_EXIT=1`, `OB_CONN_CACHE=1`. `bench.sh verify`: `IDENTICAL`
+(51,146 spikes).
+
+**Full bulb (`-g all`), network generated once at 16 ranks, then loaded:**
+
+| Run | Ranks | Setup | Solver | Wall | Teardown | Peak RSS/rank |
+|---|---|---|---|---|---|---|
+| generate cache (`-t 1`) | 16 | 95.1 s | — | 147 s | 5.8 s | 5.6 GB |
+| load, 1050 ms, NEURON 01 + 02 | 4 | 72.5 / 68.8 s | **106.9 / 105.7 s** | 276 / 266 s | 2.7 s | 11.1 GB |
+| load, 1050 ms, NEURON 01 only | 4 | 71.3 / 71.4 s | 112.1 / 112.8 s | 279 / 280 s | 2.8 s | — |
+
+Against the unpatched 4-rank run above (setup 504 s, teardown ~748 s, wall 1368 s): **wall clock 1368 s ->
+~270 s (5x)** at the same solver time. What is left besides the solve: setup ~70 s, `stdinit` + handoff
+~54 s, spike sort/write ~24 s (26.9M spikes) + weights ~12 s.
+
+**Half bulb (`-g first:64`, 1,821,372 `ThreshDetect`s), 1 rank**, generated at 16 ranks (55.3 s setup),
+NEURON 01 + 02 + 03: setup 133.3 s, **solver 67.3 s** (1050 ms), 11,477,230 spikes, wall 344 s, peak RSS
+21.9 GB, teardown 3.5 s. Profiled at `-t 20` (default nsys trace): 2.64 s vs 2.46 s bare (+7.1%).
 
 ## Setup and teardown performance
 
@@ -564,9 +592,10 @@ depends on `-n`, **spikes are identical across rank counts**: 5 glomeruli loaded
 At 5 glomeruli, 4 ranks: 13.1 s -> 6.7 s. What remains is object creation (synapses ~30 s at 1 rank,
 quarter bulb) plus ~24 s of cells, granules and bookkeeping.
 
-**Estimated for the H100, full bulb, 1 rank:** today's default ~690 s setup -> **~280–305 s (~5 min)**
-with the cache (search ~400 s -> ~0; synapse construction ~180 s and everything else ~90–115 s remain).
-Estimate, not measurement.
+**Measured on the H100** (2026-09-23): full bulb, generated at 16 ranks (95.1 s setup, of which 53.8 s
+candidate search), loaded at 4 ranks in **68.8–72.5 s** (synapse construction ~47 s of it). A full-bulb
+setup at 1 rank took 243 s, but that run then cannot simulate (see Gotchas: 1 rank is capped at ~2.1M
+`ThreshDetect`s). Half bulb (`first:64`), 1 rank: 133 s.
 
 **Using it** — generate once at a high rank count (fast), then run at any rank count:
 
@@ -643,8 +672,35 @@ GPU build compiles its `CudaProfiling` backend (`-DCORENEURON_CUDA_PROFILING`), 
 `phase_begin`/`phase_end` were empty. `patches/nrn/01-nvtx-ranges-for-coreneuron-phases.patch` makes
 them `nvtxRangePushA`/`nvtxRangePop` (NVTX3 is header-only in the CUDA toolkit; with no tool attached
 the calls are near-free), so every phase shows up in Nsight Systems with no hand-placed ranges.
-`NRN_PROFILE_REGIONS=a,b,c` limits which phases are emitted. The patch doesn't change numerics
-(`bench.sh verify` passes, spikes identical to the unpatched references).
+The patch doesn't change numerics (`bench.sh verify` passes, spikes identical to the unpatched
+references).
+
+**`NRN_PROFILE_REGIONS` does not work for these runs.** Upstream reads that allowlist only in
+`Instrumentor::init_profile()`, whose one caller is standalone `special-core`
+(`src/coreneuron/apps/coreneuron.cpp`); in-process CoreNEURON (`run_bulb.sh`, `profile_bulb.sh`) never
+calls it, so the list stays empty and every phase is emitted. Verified on the H100: a 46-name allowlist
+left the trace unchanged.
+
+**NEURON patch 03 (`03-no-per-event-net-receive-range.patch`, default) removes the per-event
+`net-receive-<mechanism>` phase** in `NetCon::deliver()`. It fired once per delivered event — ~1,720 times
+per timestep per rank at full bulb (`net-receive-FastInhib` 408k + `net-receive-AmpaNmda` 326k of ~768k
+ranges in 426 steps) against ~100 for every other phase combined — and it built a heap-allocated
+`std::string` per event even with no tool attached. Profiling-only; `bench.sh verify` stays `IDENTICAL`.
+Effect on nsys overhead (H100, full bulb, 4 ranks, `-t 20`, MPS, single runs):
+
+| Build | Trace | Solver | Overhead vs bare |
+|---|---|---|---|
+| 01 + 02 | bare | 3.35 s | — |
+| 01 + 02 | `cuda,nvtx,osrt,mpi` (default) | 4.32 s | +29% |
+| 01 + 02 | `NSYS_TRACE=nvtx`, no sampling | 4.04 s | +21% |
+| **01 + 02 + 03** | bare | 3.23 s | — |
+| **01 + 02 + 03** | `cuda,nvtx,osrt,mpi` (default) | **3.54 s** | **+9.8%** |
+| **01 + 02 + 03** | `NSYS_TRACE=nvtx`, no sampling | **3.40 s** | **+5.3%** |
+
+`profile_bulb.sh` takes `NSYS_TRACE` (the `--trace` list, default `cuda,nvtx,osrt,mpi`) and `NSYS_EXTRA`
+(extra nsys flags) from the environment. For the lowest-overhead trace:
+`NSYS_TRACE=nvtx NSYS_EXTRA="--sample=none --cpuctxsw=none" ./profile_bulb.sh ...` — phase timings only,
+so `rank<N>.phases.txt` has no CUDA/MPI attribution.
 
 `profile_bulb.sh` now also writes `rank<N>.phases.txt`, produced by `analyze_nvtx.py`. That joins the
 trace's NVTX ranges with CUDA API calls, GPU kernels and MPI calls (nsys's own reports summarize them
@@ -772,10 +828,15 @@ sessions — because of the drift noted above.) Most of that saving is WSL2's pe
 managed-memory charge. On native Linux the saving is ~5 launches x a few µs per
 step, well under 1% of an H100 timestep, so it was left out to keep the patch generic and simple.
 
-**Expect less on the H100.** On WSL2 every removed round trip also removes a managed-memory charge
-(0.3–1 ms at quarter scale, see "NVTX ranges" above), which native Linux does not pay. The removed
-*counts* — ~20 syncs and ~19 copies per step — carry over; their value there is native round-trip cost
-x count. To measure it on the H100:
+**Much less on the H100, as expected.** On WSL2 every removed round trip also removes a managed-memory
+charge (0.3–1 ms at quarter scale, see "NVTX ranges" above), which native Linux does not pay. The
+removed *counts* — ~20 syncs and ~19 copies per step — carry over; their value there is native
+round-trip cost x count. **Measured** (full bulb, 4 ranks, 1050 ms, cached network, MPS, runs
+interleaved base/base/p02/p02): baseline 112.1 / 112.8 s, patch 02 106.9 / 105.7 s — **5.5% faster**,
+with repeats agreeing within ~1%. Spikes could not be checked bit-for-bit at this size (see Gotchas: GPU
+runs are not reproducible run to run at full bulb); totals matched exactly (26,874,662). Traces of both
+builds: `runs/20260923-040828_prof_np4_t20_gall` (baseline) and `runs/20260923-040054_prof_np4_t20_gall`
+(patch 02) on that instance. To re-measure:
 
 ```bash
 NRN_PATCHES_UPTO=01 ./02_build_neuron.sh && ./03_build_model.sh   # baseline (NVTX only)
@@ -802,6 +863,26 @@ single-stream for the tarball):
 
 Validated: `./bench.sh verify` inside `bulb:dev` produced 51,146 spikes with the same md5 as bare metal.
 See the container gotchas below — a dev-image run needs the host MPI bind-mounted.
+
+**The published dev image is stale (as of 2026-09-23): it lacks `libfl-dev`, so NEURON will not build in
+it.** See Gotchas for the one-line workaround; the `Dockerfile` is fixed, but the image in the registry
+(`…/bulb:latest`, built 2026-09-20) has not been rebuilt and re-pushed yet.
+
+Building *inside* the dev image from scratch (no host toolchain at all, which is how the 2026-09-23 H100
+run was done): start one long-lived container and `docker exec` into it, so builds and runs share state:
+
+```bash
+sudo docker run -d --name bulb-dev --init --gpus all --ipc=host --cap-add=SYS_ADMIN \
+     -v /tmp/nvidia-mps:/tmp/nvidia-mps -v "$PWD:$PWD" -w "$PWD" -e CCACHE_DIR="$PWD/.ccache" \
+     <registry>/bulb:latest sleep infinity
+sudo docker exec -u root bulb-dev bash -c 'apt-get update && apt-get install -y libfl-dev'   # stale image only
+sudo docker exec bulb-dev bash -lc './setup_all.sh'
+sudo docker exec -e OB_CONN_CACHE=1 bulb-dev bash -lc './run_bulb.sh -m gpu -n 4 -t 1050 -g all'
+```
+
+Environment variables for the model (`OB_*`, `NSYS_*`) must be passed with `docker exec -e`. Use
+`--init`: without it the container's PID 1 (`sleep`) never reaps nsys's daemons, and every profile leaves
+~8 zombie processes behind (harmless, but they pile up).
 
 ## Porting to the benchmark machine
 
@@ -888,3 +969,30 @@ See the container gotchas below — a dev-image run needs the host MPI bind-moun
   spikes differ on CPU (state and events set up by NEURON's custom `init()` aren't in the dump), and on
   GPU it segfaults in `OdorStimHelper`'s legacy Random123 `VERBATIM` code. Use the in-process
   modes (`run_bulb.sh`, optionally `-- --filemode`), which are what NEURON's CI validates.
+* **The published dev image cannot build NEURON: `cannot open source file "FlexLexer.h"`** (at ~83%, in
+  `src/nmodl/lexer/nmodl_base_lexer.cpp`). Ubuntu 24.04 ships that header in `libfl-dev`, not in
+  `flex`. The `Dockerfile` now installs it, but the registry image (`…/bulb:latest`, built 2026-09-20)
+  predates the fix and **still needs rebuilding and re-pushing**
+  (`sudo docker build --target dev -t <registry>/bulb:latest --build-arg CUDA_ARCH=90 . && sudo docker push <registry>/bulb:latest`).
+  Until then, in a running container: `sudo docker exec -u root bulb-dev bash -c 'apt-get update && apt-get install -y libfl-dev'`,
+  then `./02_build_neuron.sh --clean` — `--clean` matters, because CMake caches
+  `FLEX_INCLUDE_DIR-NOTFOUND`.
+* **The full bulb cannot run on 1 rank** (or on any single NrnThread): after a normal 243 s setup,
+  `psolve` fails with `integer overflow maximum of ~2147483 artificial cells of a given type can be
+  created per NrnThread, this model has 3580916 instances of ThreshDetect`. CoreNEURON's handoff
+  encodes artificial-cell output indices in an `int32` as roughly `-(1000 * index)`. Use `-n 2` or more
+  for `-g all` (1.79M per rank). `first:64` (1,821,372) fits on 1 rank; the limit is ~2,147,483.
+* **At full bulb, GPU spikes are not reproducible run to run**, even with one build and one cached
+  network: repeat runs differ by ~10–50 of 26.9M spikes, each moved by exactly one `dt`, all after
+  ~900 ms; totals stay identical. Differences *between* NEURON patch 01 and 02 builds are the same size as
+  within a build, so they don't come from patch 02. A likely cause (not verified) is nondeterministic
+  floating-point accumulation order on the GPU, amplified over 22,400 steps until a threshold crossing
+  shifts. `bench.sh verify` (1 glomerulus, 50 ms) is unaffected. **Bit-identical checks of a NEURON patch
+  therefore have to use small models**; at full bulb, compare totals and the spread across repeats.
+* **A run that dies with a Python exception still pays the O(P²) teardown**: the fast exit hooks
+  `util.finish()`, which the exception skips, so interpreter shutdown frees the whole graph. The
+  1-rank full-bulb overflow above sat at 100% CPU after its traceback until killed. Kill such a rank by
+  verified PID (see the teardown gotcha above).
+* **`docker` needs `sudo` on a fresh instance**: `ubuntu` is not in the `docker` group
+  (`permission denied ... /var/run/docker.sock`). Either use `sudo docker ...` (as the commands here do)
+  or `sudo usermod -aG docker ubuntu` and log in again.

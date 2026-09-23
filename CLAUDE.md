@@ -44,8 +44,10 @@ document explicitly why the network legitimately changed.
    further, **profile before believing any lead** — `profile_setup.py` needs no GPU, and cProfile
    already refuted two plausible-looking leads that were read from the code.
 8. **Solver profiling**: NEURON patch 02 (default) cuts spike-event delivery's GPU round trips
-   (~2x solver on the 4090, bit-identical). On the H100, measure it against the NVTX-only
-   baseline: `NRN_PATCHES_UPTO=01 ./02_build_neuron.sh && ./03_build_model.sh`, time, then
+   (~2x solver on the 4090, bit-identical; **measured 5.5% on the H100**, full bulb / 4 ranks, 2026-09-23).
+   NEURON patch 03 (default) drops a per-event NVTX range, cutting nsys overhead from ~29% to ~10%.
+   `NRN_PROFILE_REGIONS` is ignored in in-process runs (README "NVTX ranges"). To re-measure 02 against
+   the NVTX-only baseline: `NRN_PATCHES_UPTO=01 ./02_build_neuron.sh && ./03_build_model.sh`, time, then
    `./02_build_neuron.sh && ./03_build_model.sh`, time again (same -n/-t/-g). To profile, run
    `./profile_bulb.sh -n 1 -t 20 -g first:32 -r 0`, read `runs/<dir>/rank0.phases.txt`. First run
    `gpu_roundtrip_check.cu` (README "NVTX ranges"): if `concurrentManagedAccess=0` (e.g. WSL2), solver
@@ -65,3 +67,9 @@ document explicitly why the network legitimately changed.
 - Don't use `--dump-model` + standalone `special-core`: not equivalent for this model and it
   crashes on GPU. Use `run_bulb.sh` (in-process CoreNEURON).
 - `Solver Time` is the benchmark metric; network setup (`setup_s`) is serial Python and slow.
+- The full bulb (`-g all`) cannot run on 1 rank (CoreNEURON int32 limit, ~2.1M `ThreshDetect` per
+  NrnThread); use `-n 2`+. `first:64` fits on 1 rank.
+- At full bulb, GPU spikes differ run to run by a few dozen of 26.9M (one-`dt` shifts late in the run),
+  even for one build. Do bit-identical patch checks at small sizes (`bench.sh verify`, 5 glomeruli).
+- The registry dev image lacks `libfl-dev` (NEURON fails on `FlexLexer.h`); install it in the container
+  and `02_build_neuron.sh --clean` until the image is rebuilt (see NOTES.md). `docker` needs `sudo`.

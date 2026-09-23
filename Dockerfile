@@ -87,7 +87,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 # failure rather than a missing package.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential cmake git ca-certificates time \
-        bison flex libreadline-dev libncurses-dev \
+        bison flex libfl-dev libreadline-dev libncurses-dev \
         python3-dev python3-venv \
     && rm -rf /var/lib/apt/lists/*
 
