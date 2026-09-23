@@ -1,0 +1,17 @@
+diff --git a/src/coreneuron/network/netcvode.cpp b/src/coreneuron/network/netcvode.cpp
+index f30c651..13b8f25 100644
+--- a/src/coreneuron/network/netcvode.cpp
++++ b/src/coreneuron/network/netcvode.cpp
+@@ -387,9 +387,9 @@ void NetCon::deliver(double tt, NetCvode* /* ns */, NrnThread* nt) {
+     nt->_t = tt;
+ 
+     // printf("NetCon::deliver t=%g tt=%g %s\n", t, tt, pnt_name(target_));
+-    std::string ss("net-receive-");
+-    ss += nrn_get_mechname(typ);
+-    Instrumentor::phase p_get_pnt_receive(ss.c_str());
++    // No per-event "net-receive-<mech>" profiler phase here: with ~1700 events per timestep
++    // those ranges dominated the NVTX range count and the tracing overhead, and building the
++    // name cost a heap allocation per event even with no profiler attached.
+     (*corenrn.get_pnt_receive()[typ])(target_, u.weight_index_, 0);
+ #ifdef DEBUG
+     if (errno && nrn_errno_check(typ))

@@ -16,6 +16,10 @@
 #       Prefer bounding the trace with a small -t instead, and keep -d as a safety net.
 #   -r  comma-separated ranks to profile, or "all" (default "all"). Unprofiled ranks
 #       run bare, so the job stays a normal N-rank MPI job either way.
+#   NSYS_TRACE (env) nsys --trace list (default cuda,nvtx,osrt,mpi). NSYS_TRACE=nvtx gives
+#       the lowest-overhead trace: phase timings only, no per-phase CUDA/MPI attribution.
+#   NSYS_EXTRA (env) extra nsys flags, e.g. "--sample=none --cpuctxsw=none" to also drop
+#       CPU sampling and context-switch tracing.
 #
 # Output: runs/<timestamp>_prof_.../rank<N>.nsys-rep, kernel/API/NVTX summaries (CSV), and
 # rank<N>.phases.txt: CUDA syncs/copies/launches and MPI attributed to each CoreNEURON
@@ -26,6 +30,7 @@ TOP="$(cd "$(dirname "$0")" && pwd)"
 source "$TOP/env.sh"
 
 NP=4 TSTOP=50 GLOMS=5,37,32,78,7 DUR=0 WHICH=all
+NSYS_TRACE="${NSYS_TRACE:-cuda,nvtx,osrt,mpi}" NSYS_EXTRA="${NSYS_EXTRA:-}"
 while getopts "n:t:g:d:r:h" o; do
   case $o in
     n) NP=$OPTARG ;; t) TSTOP=$OPTARG ;; g) GLOMS=$OPTARG ;; d) DUR=$OPTARG ;; r) WHICH=$OPTARG ;;
@@ -59,7 +64,7 @@ if [ "\$prof" = 1 ]; then
   exec nsys profile \\
     --capture-range=cudaProfilerApi --capture-range-end=stop \\
     $DUR_ARG \\
-    --trace=cuda,nvtx,osrt,mpi --mpi-impl=openmpi \\
+    --trace=$NSYS_TRACE --mpi-impl=openmpi $NSYS_EXTRA \\
     --cuda-memory-usage=false --force-overwrite=true \\
     -o "$RUN_DIR/rank\$r" \\
     "\$@"
